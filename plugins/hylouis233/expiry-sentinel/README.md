@@ -36,6 +36,10 @@ reset cards are left.
 Credit detail, reset cards by expiry, and platform credit pools each get their own
 table, sorted by the date they lapse.
 
+> **Note on the screenshots.** They were captured from a real account, so the
+> balances, dates, and totals in them are genuine numbers rather than samples.
+> No card IDs are shown anywhere in the UI.
+
 ## How the decision works
 
 When the 5-hour or weekly quota runs out, requests start spending credits. That is
