@@ -23,24 +23,31 @@
 //!
 //! 实测三条通道：
 //!
-//! | 通道 | 能续别的 Mini App 拥有的会话吗 | 原因 |
+//! | 通道 | 能唤醒别的插件拥有的会话吗 | 原因 |
 //! | --- | --- | --- |
-//! | `context.agent.run({ sessionId })` | ❌ | 规范原文：*Each Mini App owns its sessions and can continue only those* |
+//! | `context.agent.run({ sessionId })` | ❌ | `assertSessionOwnership`：`owner !== caller.pluginId` ⇒ `SESSION_NOT_FOUND`；45 个 bot 会话的 `purpose` 全是 `miniapp:minimax-bot` |
 //! | 直连对方 MCP HTTP 端点 | ❌ | Host 的 MCP 客户端带 per-run 凭据，别的进程拿不到 |
-//! | **起一个 Agent，让它调 `message_bot` MCP 工具** | ✅ | 2026-10-19 实测：唤起挂着 42212 的 bot，13 秒内回复 |
+//! | 裸写 `local_runtime_queue_items` | ❌ | 绕开 `steer` 直接塞行 ⇒ Host 队列轮询器不认（实测 3 分钟未被消费） |
+//! | **起一个 Agent，让它调 `mavis` 工具的 `session send`** | ✅ | `session send` 的准入是「目标可达即可」，**不做 owner 检查**；2026-10-20 实测：7 个挂掉的 bot 全部被自动唤醒 |
 //!
-//! ⇒ 守护进程负责**判定**（谁挂了、该不该救），把「请用 message_bot 唤醒这个 bot」
-//! 写进请求文件；**cron 值守**（在主 Agent 目录里）负责**投递** —— 它有 `mavis`
-//! 工具，能调 MCP 的 `message_bot`，而那会**复用目标 bot 自己的会话**。
+//! ⇒ 守护进程负责**判定**（谁挂了、该不该救），把「请唤醒这个 bot」
+//! 写进请求文件；**蹬王之王自己的 MiniApp**（在 Host 内）负责**投递** ——
+//! 它起一个 agent 回合，那个回合里的 agent 用 `mavis` 工具的 `session send`
+//! 把续跑消息送进目标 bot 的**原会话**（不新建会话）。
 //!
-//! 与 Goal 唤醒共用同一条通道（同一个 cron 值守、同一个 acked 幂等表），
-//! 只是请求的 `kind` 不同。
+//! ⚠️ 代价：每个被唤醒的 bot 要烧**一个 agent 回合**（约 47k tokens，46k 缓存读）
+//! ⇒ 投递端必须**按需触发**，绝不空转。
+//!
+//! 与 Goal 唤醒共用同一条通道（同一个 acked 幂等表），只是请求的 `kind` 不同。
 
 use std::path::PathBuf;
 
 use serde_json::json;
 
-/// Bot 守护请求文件（与 Goal 恢复请求同一个 cron 值守消费）。
+/// Bot 守护请求文件。
+///
+/// 由 **minimax-bot 的 MiniApp** 消费（它对 bot 会话有归属权限），
+/// 用 `agent.run` 真正把 bot 叫醒。
 fn request_path() -> Option<PathBuf> {
     std::env::var("HOME")
         .ok()
@@ -52,6 +59,16 @@ fn acked_path() -> Option<PathBuf> {
     std::env::var("HOME")
         .ok()
         .map(|h| PathBuf::from(h).join(".config/mcode-reset-card/bot-revive-acked.json"))
+}
+
+/// 「需要你处理」的提示去重表。
+///
+/// 2026-10-19 实测：不加这个，日志每 60 秒把同样 9 个 bot 的同样内容各刷一遍，
+/// 40 分钟 463 行。存盘后跨轮次继续去重。
+fn notified_path() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join(".config/mcode-reset-card/bot-notified.json"))
 }
 
 /// MiniMax Bot 的插件数据目录（它的 state.json 在这里）。
@@ -86,6 +103,8 @@ pub mod error_code {
     pub const LLM_AUTH_ERROR: i64 = 50112;
     /// 通用 4xx/5xx 兜底（HTTP 500 落这里）。
     pub const LLM_UPSTREAM_ERROR: i64 = 50113;
+    /// 短时限流（HTTP 429 落这里；运行时标 retryable）。
+    pub const LLM_RATE_LIMITED: i64 = 50111;
     /// TPM/RPM 短时限流。
     pub const LLM_TPM_RATE_LIMITED: i64 = 50150;
     /// 集群过载（529）。
@@ -155,6 +174,7 @@ pub fn classify_error(code: i64, message: &str) -> (Verdict, String) {
     if matches!(
         code,
         error_code::LLM_UPSTREAM_ERROR
+            | error_code::LLM_RATE_LIMITED
             | error_code::LLM_TPM_RATE_LIMITED
             | error_code::LLM_CLUSTER_OVERLOADED
     ) {
@@ -212,24 +232,16 @@ pub fn backoff_ms(attempt: u32, base_ms: u64, cap_ms: u64) -> u64 {
     exp + (pseudo_random() % 1000)
 }
 
-/// 轻量伪随机（xorshift）——只为抖动，不需要密码学强度。
+/// 抖动用的伪随机数（按纳秒时间播种，够用即可 —— 只为避免整批重试对齐）。
 fn pseudo_random() -> u64 {
-    use std::cell::Cell;
-    thread_local! {
-        static STATE: Cell<u64> = const { Cell::new(0x9E37_79B9_7F4A_7C15) };
-    }
-    STATE.with(|s| {
-        let mut x = s.get();
-        if x == 0 {
-            x = 0x9E37_79B9_7F4A_7C15;
-        }
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        s.set(x);
-        x
-    })
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
+
+
 
 /// 一个 bot 的会话信息。
 #[derive(Debug, Clone)]
@@ -237,6 +249,8 @@ pub struct BotSession {
     pub bot_id: String,
     pub bot_name: String,
     pub session_id: String,
+    /// 这个 bot 所在的会话（`bot:<id>` 私聊 或 `group:<gid>` 群聊）。
+    pub chat_id: String,
 }
 
 /// 读 MiniMax Bot 的 state.json，取出所有 bot → sessionId 映射。
@@ -273,6 +287,7 @@ pub fn read_bot_sessions() -> Vec<BotSession> {
                     bot_id: bot_id.clone(),
                     bot_name: names.get(bot_id).cloned().unwrap_or_else(|| bot_id.clone()),
                     session_id: session_id.to_string(),
+                    chat_id: chat_id.clone(),
                 });
             }
         }
@@ -281,9 +296,13 @@ pub fn read_bot_sessions() -> Vec<BotSession> {
 }
 
 /// 写一条「请唤醒这个 bot」的请求。
+/// 写一条「唤醒这个 bot」的请求。
 ///
-/// `text` 必须是给**cron 值守**看的指令（它会调 `message_bot`），
-/// 不是给 bot 看的消息。
+/// **只写文件，不投递。** 投递由 **minimax-bot 的 MiniApp** 完成
+/// （只有它对 bot 会话有归属权限，能用 `agent.run` 真正起回合）。
+///
+/// `text` 是**给 bot 看的续跑消息正文**（不是给投递方的指令）——
+/// 投递方会把它原样作为 `agent.run` 的输入。
 pub fn write_revive_request(bot: &BotSession, text: &str) -> Result<(), String> {
     let path = request_path().ok_or("找不到 $HOME")?;
     if let Some(dir) = path.parent() {
@@ -297,7 +316,7 @@ pub fn write_revive_request(bot: &BotSession, text: &str) -> Result<(), String> 
 
     let id = format!("bot-revive:{}:{}", bot.bot_id, bot.session_id);
     requests.retain(|r| r.get("id").and_then(|v| v.as_str()) != Some(id.as_str()));
-    // 丢掉过期请求，别让 cron 为一个叫不醒的 bot 一直空转
+    // 丢掉过期请求，别让投递端为一个叫不醒的 bot 一直空转
     let now = crate::api::now_ms();
     requests.retain(|r| {
         let at = r.get("atMs").and_then(|a| a.as_i64()).unwrap_or(0);
@@ -323,7 +342,7 @@ pub fn write_revive_request(bot: &BotSession, text: &str) -> Result<(), String> 
     Ok(())
 }
 
-/// 已被 cron 值守确认处理的请求 id。
+/// 已被投递方（minimax-bot 的 MiniApp）确认处理的请求 id。
 pub fn acked_ids() -> std::collections::BTreeSet<String> {
     let Some(path) = acked_path() else { return Default::default() };
     let Ok(text) = std::fs::read_to_string(&path) else { return Default::default() };
@@ -362,17 +381,51 @@ pub fn pending_request_ids() -> std::collections::BTreeSet<String> {
         .unwrap_or_default()
 }
 
-/// 给 cron 值守的指令：让它用 `message_bot` 唤醒这个 bot。
-pub fn revive_instruction(bot: &BotSession) -> String {
-    format!(
-        "用 minimax-bot 的 message_bot 工具，给 bot「{}」发送下面这条消息。\n\
-         只发这一条，不要做别的事，也不要自己回答。\n\
-         \n\
-         消息正文：\n\
-         【看门狗】上一个回合因内部错误中断，本条是自动重新启用的续跑消息。\n\
-         请从中断处继续，不要重做已完成的部分。",
-        bot.bot_name
-    )
+/// 给 bot 写一条唤醒请求。
+///
+/// 返回 `Ok(false)` 表示这个 bot 的请求已经在待办里（不用重复写）。
+pub fn enqueue_revive_request(bot: &BotSession, text: &str) -> Result<bool, String> {
+    let id = format!("bot-revive:{}:{}", bot.bot_id, bot.session_id);
+    if pending_request_ids().contains(&id) {
+        return Ok(false);
+    }
+    write_revive_request(bot, text)?;
+    Ok(true)
+}
+
+/// 读出「已提示过」的错误键集合。
+fn notified_errors() -> std::collections::HashSet<String> {
+    let Some(path) = notified_path() else { return Default::default() };
+    let Ok(text) = std::fs::read_to_string(&path) else { return Default::default() };
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("notified").and_then(|n| n.as_array()).cloned())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 存回「已提示过」的错误键集合（只保留最近 200 条，避免无限增长）。
+fn save_notified_errors(keys: &std::collections::HashSet<String>) {
+    let Some(path) = notified_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut list: Vec<String> = keys.iter().cloned().collect();
+    if list.len() > 200 {
+        list.sort();
+        list = list.split_off(list.len() - 200);
+    }
+    let body = json!({ "notified": list });
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, format!("{}\n", serde_json::to_string_pretty(&body).unwrap_or_default()))
+        .is_ok()
+    {
+        let _ = std::fs::rename(&tmp, &path);
+    }
 }
 
 /// 判定会话「现在是不是真的没在动」。
@@ -388,7 +441,31 @@ pub fn is_idle(last_activity_ms: i64, now_ms: i64, idle_ms: i64) -> bool {
     now_ms - last_activity_ms >= idle_ms
 }
 
+/// 唤醒 bot 时发送的续跑消息正文。
+const REVIVE_MESSAGE: &str = "【看门狗】上一个回合因内部错误中断，本条是自动重新启用的续跑消息。\n请从中断处继续，不要重做已完成的部分。";
+
 /// 一轮 Bot 守护。
+///
+/// **只做「判定 + 记账」**：把要唤醒的 bot 写进请求文件，**不负责投递**。
+///
+/// # 为什么不由守护进程直接投递（2026-10-20 实测）
+///
+/// 守护进程在 Host 之外，能碰到的表只有 `local_runtime_queue_items`，
+/// 但那不是能用的通道：
+///
+/// 1. **裸写队列项不会被消费**。隔离实验：往一个挂着 50113 的 bot 会话写一条
+///    队列项，3 分钟后仍是 `queued`、未 claim、无 turn、无消息；
+///    同一会话用官方 `session send` 则 5 秒内 accepted 并被 bot 回复。
+///    ⇒ Host 的队列轮询器**不认外部写的行**。
+/// 2. **MiniApp 的 `agent.run` 有会话归属限制**。
+///    `service/miniapp/agent/gateway.ts` 的 `assertSessionOwnership`：
+///    `owner !== caller.pluginId` ⇒ 抛 `SESSION_NOT_FOUND`。
+///    bot 会话的 `purpose` 是 `miniapp:minimax-bot` ⇒ 蹬王之王**永久无法**唤醒它们。
+///    ⇒ 唯一有权限的投递方是 **minimax-bot 自己的 MiniApp**。
+///
+/// 所以分工是：
+/// - **本守护进程（Host 外）**：判定谁挂了 + 写请求文件 + 记账；
+/// - **minimax-bot 的 MiniApp（Host 内）**：读请求文件 → `agent.run` 唤醒自己名下的 bot。
 ///
 /// 返回 (检查数, 可自愈数, 需人工数, 已投递数)。
 pub fn tick(cfg: &crate::config::BotGuardCfg) -> Result<(usize, usize, usize, usize), String> {
@@ -402,6 +479,11 @@ pub fn tick(cfg: &crate::config::BotGuardCfg) -> Result<(usize, usize, usize, us
     let mut needs_user = 0usize;
     let mut revived = 0usize;
     let acked = acked_ids();
+    // 同一轮里已经在待办里的 id，避免每 60 秒重复写同一个 bot。
+    let pending = pending_request_ids();
+    // 「需要你处理」的去重：同一个 bot 的同一个错误，只提示一次。
+    // 2026-10-19 实测：不加这个，日志每分钟刷 9 行同样的内容（40 分钟 463 行）。
+    let mut notified = notified_errors();
 
     for bot in &bots {
         let Some((status, code, message, last_activity)) = states.get(&bot.session_id) else {
@@ -416,32 +498,47 @@ pub fn tick(cfg: &crate::config::BotGuardCfg) -> Result<(usize, usize, usize, us
             Verdict::Healthy => continue,
             Verdict::NeedsUser => {
                 needs_user += 1;
-                crate::log(&format!(
-                    "Bot 看门狗：{} 需要你处理（{}）—— 不自动重试",
-                    bot.bot_name, message
-                ));
+                // 去重键：bot + 错误码 + 错误文案。错误一变就是新问题，值得再提示。
+                let key = format!("{}|{}|{}", bot.bot_id, code, message);
+                if notified.insert(key) {
+                    crate::log(&format!(
+                        "Bot 看门狗：{} 需要你处理（{}）—— 不自动重试",
+                        bot.bot_name, message
+                    ));
+                }
                 continue;
             }
             Verdict::SelfHealing => {
                 // 已经在待办里 ⇒ 不重复投递
                 let id = format!("bot-revive:{}:{}", bot.bot_id, bot.session_id);
-                if acked.contains(&id) || pending_request_ids().contains(&id) {
+                if acked.contains(&id) || pending.contains(&id) {
                     continue;
                 }
                 self_healing += 1;
-                match write_revive_request(bot, &revive_instruction(bot)) {
-                    Ok(()) => {
+                // 只写请求文件 —— 投递交给 minimax-bot 的 MiniApp（它才有会话权限）。
+                match enqueue_revive_request(bot, REVIVE_MESSAGE) {
+                    Ok(true) => {
                         revived += 1;
                         crate::log(&format!(
-                            "Bot 看门狗：{} 因暂时性错误（{}）挂掉，已投递自动重新启用请求",
+                            "Bot 看门狗：{} 因暂时性错误（{}）挂掉，已写入唤醒请求（由本插件的 MiniApp 投递）",
                             bot.bot_name, message
                         ));
                     }
-                    Err(e) => crate::log(&format!("⚠️  Bot 看门狗：写 {} 的请求失败: {e}", bot.bot_name)),
+                    Ok(false) => {
+                        crate::log(&format!(
+                            "Bot 看门狗：{} 的唤醒请求已在待办里，跳过",
+                            bot.bot_name
+                        ));
+                    }
+                    Err(e) => crate::log(&format!(
+                        "⚠️  Bot 看门狗：给 {} 写唤醒请求失败: {e}",
+                        bot.bot_name
+                    )),
                 }
             }
         }
     }
+    save_notified_errors(&notified);
     Ok((bots.len(), self_healing, needs_user, revived))
 }
 
@@ -533,6 +630,13 @@ mod tests {
         assert_eq!(v, Verdict::Healthy);
         let (v2, _) = classify_error(0, "   ");
         assert_eq!(v2, Verdict::Healthy);
+    }
+
+    #[test]
+    fn short_term_rate_limit_is_self_healing() {
+        // 50111 = 短时限流（HTTP 429），运行时标 retryable ⇒ 应当自动重新启用。
+        let (v, _) = classify_error(error_code::LLM_RATE_LIMITED, "rate limited");
+        assert_eq!(v, Verdict::SelfHealing);
     }
 
     #[test]

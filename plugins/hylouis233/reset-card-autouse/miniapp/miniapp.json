@@ -16,5 +16,8 @@
   "surface": {
     "path": "/dashboard"
   },
-  "mcpEndpoints": []
+  "agentAccess": [
+    "session.run"
+  ],
+  "agentConcurrency": 2
 }

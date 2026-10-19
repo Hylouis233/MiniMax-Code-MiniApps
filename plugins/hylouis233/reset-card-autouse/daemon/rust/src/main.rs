@@ -553,6 +553,34 @@ fn main() {
         selftest();
         return;
     }
+    // 自检：写一条唤醒请求（不直接投递）。
+    // 投递由 minimax-bot 的 MiniApp 用 `agent.run` 完成 —— 守护进程在 Host 之外，
+    // 没有对 bot 会话的归属权限，裸写队列项也不会被消费（2026-10-20 实测）。
+    if let Some(i) = args.iter().position(|a| a == "--selftest-bot-revive") {
+        let Some(session_id) = args.get(i + 1) else {
+            eprintln!("用法: --selftest-bot-revive <sessionId> <botName>");
+            std::process::exit(2);
+        };
+        let bot_name = args.get(i + 2).cloned().unwrap_or_else(|| "Bot".to_string());
+        let bot = bot_guard::BotSession {
+            bot_id: format!("bot-selftest-{bot_name}"),
+            bot_name: bot_name.clone(),
+            session_id: session_id.clone(),
+            chat_id: format!("bot:bot-selftest-{bot_name}"),
+        };
+        match bot_guard::enqueue_revive_request(
+            &bot,
+            "【看门狗自检】请简短确认收到这条续跑消息。",
+        ) {
+            Ok(true) => println!("已写入唤醒请求：{session_id}"),
+            Ok(false) => println!("已在待办里，跳过：{session_id}"),
+            Err(e) => {
+                eprintln!("写请求失败：{e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
 
     let mut interval: f64 = 60.0;
     let mut dry_run = false;

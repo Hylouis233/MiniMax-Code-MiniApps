@@ -90,13 +90,18 @@ channels were measured on 2026-10-19:
 
 | Channel | Can it continue another Mini App's session? | Verdict |
 | --- | --- | --- |
-| `context.agent.run({ sessionId })` | No | The contract says *each Mini App owns its sessions and can continue only those* |
+| `context.agent.run({ sessionId })` | No | `assertSessionOwnership` rejects it: `owner !== caller.pluginId` ⇒ `SESSION_NOT_FOUND`. All 45 Bot sessions carry `purpose = 'miniapp:minimax-bot'` |
 | Calling the other Mini App's MCP endpoint directly | No | The Host's MCP client sends a per-run credential that other processes do not have |
-| **Running an Agent that calls the `message_bot` MCP tool** | **Yes** | Measured: a Bot stuck on 42212 woke up and answered within 13 seconds |
+| Writing a row into `local_runtime_queue_items` by hand | No | That bypasses `steer`; the Host's queue poller ignores rows it did not write. Measured: still `queued` and unclaimed after 3 minutes, while `session send` was accepted in 5 seconds |
+| **Running an Agent that calls the `mavis` tool's `session send`** | **Yes** | `session send` admits on reachability alone — *there is no topology check* — so any session holding the `mavis` tool can wake any Bot session. Measured on 2026-10-20: 7 stuck Bots were all woken and answered |
 
-So the watchdog decides *who* needs waking and writes the request; a small cron
-watcher in the main agent directory performs the delivery through `message_bot`.
-The target Bot keeps its own session, memory and conversation history.
+So the watchdog decides *who* needs waking and writes the request; this Mini App
+performs the delivery from inside the Host by starting an agent turn whose agent
+calls `session send`. The target Bot keeps its own session, memory and
+conversation history.
+
+**Cost.** Each wake costs one agent turn (about 93k tokens end to end). The loop
+therefore runs **only when there is something pending** — it never spins.
 
 ## Retry policy: retryable failures are retried forever
 
@@ -148,14 +153,18 @@ single time.
 | Actor | Pause a goal | Start a turn (resume) |
 | --- | --- | --- |
 | **Daemon** (outside the Host) | Yes — writes the goal store; the runtime sees it at the next turn boundary | No |
-| **Mini App** (inside the Host) | No | No — `context.agent.run` only reaches sessions in its own agent directory |
-| **Cron watcher** (main agent directory) | Yes | Yes — `session send` reaches any session |
+| **This Mini App** (inside the Host) | No | Yes — through an agent turn that calls the `mavis` tool's `session send` |
 | **Host main process** (Electron IPC) | Yes | Yes — but it listens on no TCP port, so nothing outside can reach it |
 
-Resuming a goal therefore needs a delivery channel that lives in the main agent
-directory. The daemon decides and records; a small cron watcher performs the delivery.
-The cron is armed **only while there is something to deliver**, because each of its
-rounds costs roughly 47k tokens.
+Resuming a goal therefore needs a delivery channel that lives inside the Host. The
+daemon decides and records; this Mini App performs the delivery. The wake loop runs
+**only while there is something to deliver**, because each wake costs an agent turn.
+
+**v1.4 removed the cron watcher.** It was unreliable: the runtime archives the
+session a cron watcher runs in, so the next trigger failed with
+`CRON_SESSION_TARGET_ARCHIVED` (measured: 4 delivered, 8 failed out of 12), and each
+round cost roughly 47k tokens. Nothing about the daemon's decision-making changed —
+only the delivery path.
 
 ## Configuration files
 
@@ -164,7 +173,10 @@ rounds costs roughly 47k tokens.
 | `~/.config/mcode-reset-card/config.json` | Shared thresholds (above). |
 | `~/.config/mcode-reset-card/goal-pause.json` | Ledger of goals **we** paused, so goals you paused by hand are never touched. |
 | `~/.config/mcode-reset-card/goal-resume-requests.json` | Pending wake-up requests. |
-| `~/.config/mcode-reset-card/goal-resume-acked.json` | Which requests have been handled (idempotency). |
+| `~/.config/mcode-reset-card/goal-resume-acked.json` | Which goal requests have been handled (idempotency). |
+| `~/.config/mcode-reset-card/bot-revive-requests.json` | Pending Bot wake-up requests. |
+| `~/.config/mcode-reset-card/bot-revive-acked.json` | Which Bot requests have been handled (idempotency). |
+| `~/.config/mcode-reset-card/bot-notified.json` | Which Bot errors have already been reported, so the same one is not repeated every minute. |
 | `/tmp/mcode-reset-card.log` | Daemon log. |
 
 ## Tested environment
@@ -186,9 +198,10 @@ rounds costs roughly 47k tokens.
   `agent.minimaxi.com` (Code credit expiry). No other hosts.
 - **Credentials:** the daemon reads the OAuth lease issued by the local desktop app.
   It never stores a token itself, and this repository contains no credentials.
-- **Agent tasks:** the Mini App runs a small watcher cron that reads two JSON files and
-  calls `session send` on your behalf to wake a paused goal. It does not run any other
-  task, and it changes nothing except those two files.
+- **Agent tasks:** the Mini App runs a small wake loop that reads the request files and
+  calls `session send` on your behalf to wake a paused goal or a stuck Bot. It runs
+  only when something is pending, does no other task, and changes nothing except
+  those files and the Bot's own session.
 
 ## Known boundaries
 
@@ -198,6 +211,12 @@ rounds costs roughly 47k tokens.
 - A goal whose session has been idle for a long time, or one stuck inside an
   unfinished turn, cannot be woken from outside — open that session in MiniMax Code
   once so the runtime has a live session to attach to.
+- **The Mini App has no resident mode.** The Host accepts `lifecycle: "background"`
+  in the manifest but forces it back to `"on-demand"` when it reads it, so the
+  delivery loop only runs while the panel is open. The daemon keeps deciding and
+  recording while the panel is closed; the wake-ups are delivered when it opens again.
+- Each wake costs one agent turn (about 93k tokens end to end), and a Bot that
+  fails with a rate-limit error (50150) may need another attempt on a later round.
 
 ## Documentation
 

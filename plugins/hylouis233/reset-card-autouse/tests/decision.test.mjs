@@ -1,16 +1,23 @@
 // 决策与聚合逻辑测试：不触网、不扣卡。
 // fixture 来自真实接口（2026-10-17 实测，page_number/page_size/include_expired）。
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync, copyFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const src = readFileSync(new URL('../miniapp/node/server.mjs', import.meta.url), 'utf8');
 const body = src.replace(/export async function start[\s\S]*$/, '');
-const mod = await import(
-  'data:text/javascript;base64,' +
-    Buffer.from(
-      body +
-        '\nexport { percent, amount, parsePlatformPools, parseCodeCredits, parseQuota, expiringWithin, decide, isRetryableStatus, retryDelayMs, RETRY_CAP_MS };',
-    ).toString('base64')
+// ⚠️ 不能用 data: URL 导入 —— server.mjs 有相对 import（./bot_wakeup.mjs），
+//    data: URL 解析不了相对路径（ERR_UNSUPPORTED_RESOLVE_REQUEST）。
+// ⇒ 复制成临时 .mjs 文件再 import（顺带把 bot_wakeup.mjs 复制过去供相对 import）。
+const modDir = mkdtempSync(join(tmpdir(), 'expiry-test-'));
+const modFile = join(modDir, 'server-under-test.mjs');
+writeFileSync(
+  modFile,
+  body +
+    '\nexport { percent, amount, parsePlatformPools, parseCodeCredits, parseQuota, expiringWithin, decide, isRetryableStatus, retryDelayMs, RETRY_CAP_MS };',
 );
+copyFileSync(new URL('../miniapp/node/bot_wakeup.mjs', import.meta.url), join(modDir, 'bot_wakeup.mjs'));
+const mod = await import(modFile);
 
 const { decide, percent, amount, parsePlatformPools, parseCodeCredits, parseQuota, expiringWithin, isRetryableStatus, retryDelayMs, RETRY_CAP_MS } = mod;
 

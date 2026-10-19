@@ -118,10 +118,6 @@ pub struct Config {
     /// 距 5 小时额度刷新不足这么多分钟时，不消耗重置卡。0 = 关闭该保护。
     #[serde(default = "d_skip")]
     pub card_skip_before_reset_minutes: f64,
-    /// 「目标恢复值守」cron 的 id。守护进程按需武装/解除武装它
-    /// —— 没有它，恢复就没人执行；一直开着，它又每轮都在烧 token。
-    #[serde(default = "d_cron")]
-    pub resume_cron_id: String,
     #[serde(default)]
     pub quota_levels: QuotaLevels,
     #[serde(default)]
@@ -139,17 +135,12 @@ fn d_skip() -> f64 {
     DEFAULT_CARD_SKIP_BEFORE_RESET_MINUTES
 }
 
-fn d_cron() -> String {
-    String::new()
-}
-
 impl Default for Config {
     fn default() -> Self {
         Config {
             schema_version: 1,
             card_trigger_percent: DEFAULT_QUOTA_TRIGGER_PERCENT,
             card_skip_before_reset_minutes: DEFAULT_CARD_SKIP_BEFORE_RESET_MINUTES,
-            resume_cron_id: String::new(),
             quota_levels: QuotaLevels::default(),
             goal_pause: GoalPauseCfg::default(),
             bot_guard: BotGuardCfg::default(),

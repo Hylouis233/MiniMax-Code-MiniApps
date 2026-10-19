@@ -256,7 +256,7 @@ pub fn write_resume_request(goal: &WakeTarget, used_percent: f64) -> Result<(), 
 
     let id = format!("resume:{}:{}", goal.goal_id, goal.goal_updated_at_ms);
     requests.retain(|r| r.get("id").and_then(|v| v.as_str()) != Some(id.as_str()));
-    // 顺手丢掉过期的请求，别让 cron 为一个叫不醒的目标一直空转
+    // 顺手丢掉过期的请求，别让投递端为一个叫不醒的目标一直空转
     let now = now_ms();
     requests.retain(|r| {
         let at = r.get("atMs").and_then(|a| a.as_i64()).unwrap_or(0);
@@ -280,8 +280,8 @@ pub fn write_resume_request(goal: &WakeTarget, used_percent: f64) -> Result<(), 
         .map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
 
-    // ⚠️ 同一 epoch 的请求可能被 cron 之前 ack 过了。若不把它从 ack 列表里摘掉，
-    // 这条请求就会被当成「已处理」而永远不再被 cron 捡起来（实测踩过）。
+    // ⚠️ 同一 epoch 的请求可能之前已被 ack 过。若不把它从 ack 列表里摘掉，
+    // 这条请求就会被当成「已处理」而永远不再被投递（实测踩过）。
     unack(&id);
     Ok(())
 }
@@ -321,56 +321,6 @@ fn request_path() -> Option<PathBuf> {
         .map(|h| PathBuf::from(h).join(".config/mcode-reset-card/goal-resume-requests.json"))
 }
 
-/// 武装/解除武装「目标恢复值守」cron。
-///
-/// 为什么需要：那个 cron 跑在主 Agent 目录里（**只有它**能对任意会话起回合），
-/// 但每跑一轮都要烧一个 agent 回合（实测 47k tokens，其中 46k 是缓存读取）。
-/// 每 5 分钟一轮 = 每天 288 轮 —— 会吃掉我们正要保护的那块额度。
-///
-/// **开关在 `local_runtime_v2_scheduler_jobs.state`**（active / cancelled …），
-/// **不是**在 cron 定义表上。曾经的实现去软删定义行的 `deleted_at_ms`，
-/// 结果 cron API 直接报 `Cron definition not found` —— 定义被「删」了却还在调度，
-/// 既停不下来、也改不了。
-pub fn set_cron_armed(db: &PathBuf, cron_id: &str, armed: bool) -> Result<bool, String> {
-    if cron_id.is_empty() {
-        return Ok(false);
-    }
-    let now = now_ms();
-    // next_run_at_ms 的取值：武装时排到 1 分钟后（醒着），解除武装时置 NULL（停）。
-    // 约束 `local_runtime_v2_scheduler_job_next_run_check` 要求
-    // state='active' ⇒ next_run_at_ms 非空；其余状态 ⇒ 必须为 NULL。
-    let sql = format!(
-        "UPDATE local_runtime_v2_scheduler_jobs\n\
-         SET state = '{state}', next_run_at_ms = {next}, updated_at_ms = {now},\n\
-             run_count = CASE WHEN '{state}' = 'active' THEN 0 ELSE run_count END\n\
-         WHERE scheduler_id = (\n\
-           SELECT scheduler_id FROM local_runtime_v2_cron_definitions WHERE cron_id = '{cron_id}'\n\
-         );",
-        state = if armed { "active" } else { "cancelled" },
-        next = if armed { format!("{now} + 60000") } else { "NULL".into() },
-        now = now,
-        cron_id = cron_id,
-    );
-    crate::goal_sync::exec_sql(db, &sql)?;
-    Ok(true)
-}
-
-/// 这个 cron 当前是否处于生效状态。
-pub fn cron_is_armed(db: &PathBuf, cron_id: &str) -> bool {
-    if cron_id.is_empty() {
-        return false;
-    }
-    let sql = format!(
-        "SELECT j.state FROM local_runtime_v2_scheduler_jobs j\n\
-         JOIN local_runtime_v2_cron_definitions d ON d.scheduler_id = j.scheduler_id\n\
-         WHERE d.cron_id = '{cron_id}';"
-    );
-    match crate::goal_sync::exec_sql(db, &sql) {
-        Ok(out) => out.contains("active"),
-        Err(_) => false,
-    }
-}
-
 /// 已处理（acked）的请求 id 集合。
 pub fn acked_ids() -> std::collections::BTreeSet<String> {
     let path = std::env::var("HOME")
@@ -392,9 +342,8 @@ pub fn acked_ids() -> std::collections::BTreeSet<String> {
 /// 恢复请求的时效上限：超过这么久还没被处理就作废。
 ///
 /// 目的有两个：
-/// 1. 避免 cron 无限期空转烧 token（每轮约 47k tokens）；
-/// 2. 避免「会话根本叫不醒」（长期空闲的会话运行时不会消费它的队列）时，
-///    请求永远挂着、cron 永远武装着。
+/// 1. 避免投递端为一个叫不醒的目标无限期空转；
+/// 2. 避免「会话根本叫不醒」时，请求永远挂着、状态永远显示「待处理」。
 pub const RESUME_REQUEST_TTL_MS: i64 = 30 * 60 * 1000;
 
 /// 请求文件里还没被处理的 id（且未过期）。
@@ -477,7 +426,7 @@ pub fn enqueue_continuation(
     // 真实运行库里 `idx_local_runtime_queue_items_session_client_request` **不是唯一索引**
     // （迁移源文件里写的是 UNIQUE，但库里实际是普通 CREATE INDEX）。
     // 实测：同 crid 反复插会插出 6 条重复项，把目标会话的队列堵死，
-    // 结果 cron 的 session send 只能排队、起不了回合。
+    // 结果 `session send` 只能排队、起不了回合。
     let dup = format!(
         "SELECT COUNT(*) FROM local_runtime_queue_items\n\
          WHERE session_id = '{sid}' AND client_request_id = '{crid}';",

@@ -22,7 +22,8 @@
  */
 
 import { createServer } from 'node:http';
-import { readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, rmSync } from 'node:fs';
+import { tick as botWakeTick, WAKE_INTERVAL_MS } from './bot_wakeup.mjs';
 import { readFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { join, dirname } from 'node:path';
@@ -499,7 +500,6 @@ function defaultConfig() {
     schemaVersion: 1,
     cardTriggerPercent: DEFAULT_QUOTA_TRIGGER_PERCENT,
     cardSkipBeforeResetMinutes: DEFAULT_CARD_SKIP_BEFORE_RESET_MINUTES,
-    resumeCronId: '',
     botGuard: {
       enabled: false,
       idleMs: 90_000,
@@ -561,13 +561,9 @@ export function normalizeConfig(raw) {
     schemaVersion: 1,
     cardTriggerPercent,
     cardSkipBeforeResetMinutes,
-    // ⚠️ 必须原样保留 `resumeCronId`（2026-10-19 实测修的 bug）：
-    // 这个函数是**白名单式重建**，漏掉它 ⇒ 用户在 Mini App 上改任何一项设置，
-    // 都会把「目标恢复值守」cron 的 id 从配置里抹掉 ⇒ 守护进程读到空 id
-    // ⇒ `reconcile_resume_cron` 第一行就 return ⇒ cron 永远不被解除武装，
-    // 同时也不会再武装 —— 整个恢复机制静默失效，而且看不出任何报错。
-    // 它不是用户可改项，只是守护进程要知道该武装哪个 cron。
-    resumeCronId: typeof src.resumeCronId === 'string' ? src.resumeCronId : d.resumeCronId,
+    // ⚠️ `resumeCronId` 已彻底删除（2026-10-20）：本插件不再武装/解除武装任何 cron。
+    // 恢复流程改为：守护进程（Host 外）只写请求文件，**MiniMax Bot 自己的 MiniApp**
+    // 用 `agent.run` 投递（只有它对 bot 会话有归属权限）。
     // ⚠️ 同样必须原样保留 `botGuard`（2026-10-19 补）：Bot 守护的配置
     // （开关、闲置判定、退避上下限）。漏掉它 ⇒ 用户在页面改任何设置都会把
     // 守护开关抹掉 ⇒ 守护静默失效。
@@ -1734,7 +1730,50 @@ export async function start(context) {
   context.signal.addEventListener('abort', onAbort, { once: true });
   if (context.signal.aborted) await dispose();
 
-  return { dispose };
+  // ── Bot 唤醒循环 ──
+  //
+  // 后台守护进程（Host 之外，无 token、无人值守）只做**判定 + 记账**：
+  // 把「要唤醒哪个 bot」写进 `bot-revive-requests.json`。
+  // 这里（Host 之内）负责**真正投递**。
+  //
+  // 为什么投递必须在这里做（2026-10-20 全部实测，详见 docs/BOT_DIAGNOSIS.md）：
+  //
+  // 1. **裸写队列项无效**：那是绕开 `steer` 直接塞行，Host 的队列轮询器不认
+  //    （隔离实验：3 分钟未被消费；官方 `session send` 则 5 秒内 accepted）。
+  // 2. **不能直接 `agent.run` 续 bot 会话**：`assertSessionOwnership` 判
+  //    `owner !== caller.pluginId` ⇒ `SESSION_NOT_FOUND`；而 45 个 bot 会话的
+  //    `purpose` 全是 `miniapp:minimax-bot` ⇒ 本插件永远被拒。
+  // 3. **能用的路径**：起一个自己的 agent 回合（`agent.run` 不带 sessionId），
+  //    让那个回合里的 agent 用 **mavis 工具的 `session send`** 把续跑消息
+  //    送进目标 bot 会话。`session send` 的准入是「目标可达即可」，
+  //    **不做 owner 检查** ⇒ 任何有 mavis 工具的会话都能唤醒任意 bot 会话。
+  //
+  // ⚠️ 代价：每个被唤醒的 bot 要烧**一个 agent 回合**（约 47k tokens，46k 缓存读）
+  // ⇒ 所以**只在真的有 pending 请求时才跑**，绝不空转。
+  //
+  // 不依赖 cron：面板开着它就在跑；关着时守护进程照常判定与记账，等面板再开时补上。
+  const botWakeTimer = setInterval(() => {
+    botWakeTick(context.agent)
+      .then((r) => {
+        if (r.revived > 0) {
+          context.logger.warn('expiryGuardian.botWoke', { revived: r.revived });
+        }
+        for (const f of r.failed) {
+          context.logger.warn('expiryGuardian.botWakeFailed', { id: f.id, detail: f.detail });
+        }
+      })
+      .catch((e) => context.logger.warn('expiryGuardian.botWake failed', { error: String(e?.message ?? e) }));
+  }, WAKE_INTERVAL_MS);
+  botWakeTimer.unref?.();
+
+  const disposeAll = () => {
+    clearInterval(botWakeTimer);
+    void dispose();
+  };
+  context.signal.removeEventListener('abort', onAbort);
+  context.signal.addEventListener('abort', disposeAll, { once: true });
+
+  return { dispose: disposeAll };
 }
 
 function describe(error) {

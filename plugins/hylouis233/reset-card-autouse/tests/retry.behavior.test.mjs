@@ -5,13 +5,22 @@ import { readFileSync } from 'node:fs';
 
 const src = readFileSync(new URL('../miniapp/node/server.mjs', import.meta.url), 'utf8');
 const body = src.replace(/export async function start[\s\S]*$/, '');
-const mod = await import(
-  'data:text/javascript;base64,' +
-    Buffer.from(
-      body +
-        '\nexport { isRetryableStatus, retryDelayMs, RETRY_CAP_MS, fetchWithRetry };',
-    ).toString('base64')
+// ⚠️ 不能用 data: URL 导入 —— server.mjs 现在有相对 import（./bot_wakeup.mjs），
+//    data: URL 里解析不了相对路径（ERR_UNSUPPORTED_RESOLVE_REQUEST）。
+// ⇒ 改成把 server.mjs 复制成一份临时 .mjs 文件再 import；相对 import 一并复制。
+import { writeFileSync, mkdtempSync, copyFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+const modDir = mkdtempSync(join(tmpdir(), 'expiry-test-'));
+const modFile = join(modDir, 'server-under-test.mjs');
+writeFileSync(
+  modFile,
+  body +
+    '\nexport { isRetryableStatus, retryDelayMs, RETRY_CAP_MS, fetchWithRetry };',
 );
+copyFileSync(new URL('../miniapp/node/bot_wakeup.mjs', import.meta.url), join(modDir, 'bot_wakeup.mjs'));
+const mod = await import(modFile);
 const { fetchWithRetry, RETRY_CAP_MS } = mod;
 
 let hits = 0;

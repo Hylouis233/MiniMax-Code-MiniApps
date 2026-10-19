@@ -539,25 +539,20 @@ pub fn sync_with_quota(
         Err(e) => log(&format!("⚠️  账本对账失败（不影响本轮判定）: {e}")),
     }
 
-    // ── 武装/解除武装 cron ──
+    // ── 不再武装/解除武装任何 cron ──
     //
-    // ⚠️ 这个调用有**两个**时机，缺一不可（2026-10-19 20:12 实测）：
+    // 2026-10-20 彻底删除 cron 依赖。删除理由（全部实测，见 docs/BOT_DIAGNOSIS.md）：
     //
-    // 1) **分支之前**（这里）：负责**解除武装**。
-    //    原来 `reconcile_resume_cron` 只挂在恢复分支里，而额度一旦持续高于
-    //    触发线，走的就是**暂停分支** —— 那条路径没有这个调用
-    //    ⇒ cron 永远不会被解除武装，每 17 分钟空跑一轮（每轮约 47k tokens），
-    //    而 pending 请求其实早已过期（TTL 30 分钟）。
+    // 1) **cron 目标会话会被运行时归档** ⇒ 后续触发报
+    //    `CRON_SESSION_TARGET_ARCHIVED`。实测 12 次触发 = 4 成功 + 8 次归档失败。
+    // 2) **cron 只能跑在 Host 内的某个会话里**，而「固定值守会话」不可靠；
+    //    改成指向长期会话虽然 6/6 delivered，但那会把值守回合混进用户会话历史。
+    // 3) **cron 每轮烧约 47k tokens**（46k 是缓存读取），而它只需要做一件事：
+    //    把「续跑消息」送进目标会话。
     //
-    // 2) **恢复分支之后**（见下）：负责**武装**。
-    //    因为恢复请求（`goal-resume-requests.json`）是恢复分支里
-    //    `wake_goal()` 写的 —— 分支前调用时 pending 还是 0 个，
-    //    ⇒ 武装永远**慢一轮**。实测 20:12:365 日志「pending 请求 0 个，
-    //    cron 未武装」，而同一轮 20:12:458 就恢复了目标并写了请求，
-    //    但 cron 要等到下一轮才被武装 ⇒ 唤醒被推迟 1 分钟。
-    //
-    // 两次调用都不昂贵（各一次 SQL 查询 + 必要时一次 UPDATE）。
-    reconcile_resume_cron(&db, cfg);
+    // 现在这件事由 **MiniApp 的 `agent.run`** 完成 —— 它走 `turns.steer()`，
+    // 与官方 `session send` 同一条通道（实测 5 秒内 accepted 并被 bot 回复）。
+    // ⇒ 守护进程只负责**判定 + 记账**（写请求文件），不负责投递。
 
     if five_used_percent >= five_total_percent * gp.trigger_percent / 100.0 {
         match pause_active_goals(&db, now_ms) {
@@ -673,13 +668,8 @@ pub fn sync_with_quota(
                 log(&format!("⚠️  账本清空失败: {e}"));
             }
         }
-        // ── 恢复分支之后再对一次 cron：这时 `wake_goal()` 已经把恢复请求
-        // 写进文件了 ⇒ pending 非空 ⇒ 这轮就能武装 cron，不必等下一轮。
-        // （分支之前那次只负责「解除武装」，因为那时还没写新请求。）
-        reconcile_resume_cron(&db, cfg);
-
-        // ── 先清 cron 投递残留，再谈复活（顺序不能反）──
-        // 队列里堆着自家残留 ⇒ 会话判 busy ⇒ cron 的 session send 退化成排队，
+        // ── 先清投递残留，再谈复活（顺序不能反）──
+        // 队列里堆着自家残留 ⇒ 会话判 busy ⇒ 续跑消息退化成排队，
         // 于是这一轮的唤醒请求照样进不去。清完再唤醒才有意义。
         let purged = purge_stale_session_sends(&db);
         if purged > 0 {
@@ -885,62 +875,14 @@ fn revive_stranded_goals(db: &PathBuf, used_percent: f64) -> (usize, usize) {
     (ok, failed)
 }
 
-/// 有待恢复请求 → 武装「目标恢复值守」cron；全部处理完 → 解除武装。
-///
-/// 那个 cron 跑在主 Agent 目录里（**只有它**能对任意会话起回合），
-/// 但每轮都要烧一个 agent 回合（实测 47k tokens，46k 是缓存读取）。
-/// 每 5 分钟一轮 = 每天 288 轮 ≈ 13M tokens/天 —— 会吃掉我们正要保护的那块额度。
-/// 所以按需武装：只在真的要唤醒时叫醒它，唤醒完再关掉。
-fn reconcile_resume_cron(db: &PathBuf, cfg: &crate::config::Config) {
-    let cron_id = cfg.resume_cron_id.trim();
-    if cron_id.is_empty() {
-        return;
-    }
-    // ⚠️ pending 必须**合并两类请求**（2026-10-19 实测修）：
-    // 只看 Goal 的 pending ⇒ Bot 守护写的请求永远不被投递，cron 也不会被武装。
-    // 两者共用同一个 cron 值守（它的 prompt 同时处理两类请求），所以只要
-    // 任意一类有待处理，就要武装。
-    let goal_pending = crate::goal_wake::pending_request_ids();
-    let bot_pending = crate::bot_guard::pending_request_ids();
-    let pending_len = goal_pending.len() + bot_pending.len();
-    let armed = crate::goal_wake::cron_is_armed(db, cron_id);
-    // 诊断：这一轮武装状态与 pending 数量都要能看到，否则「cron 怎么还 armed」
-    // 只能靠猜（2026-10-19 实测：这个分支原来完全不打日志，排查时毫无线索）。
-    log(&format!(
-        "cron 值守状态: pending 请求 {} 个（Goal {} + Bot {}），cron {}",
-        pending_len,
-        goal_pending.len(),
-        bot_pending.len(),
-        if armed { "已武装" } else { "未武装" }
-    ));
-    if pending_len > 0 {
-        if !armed {
-            match crate::goal_wake::set_cron_armed(db, cron_id, true) {
-                Ok(_) => log(&format!(
-                    "已武装「目标恢复值守」cron（{} 个待处理：Goal {} + Bot {}）",
-                    pending_len,
-                    goal_pending.len(),
-                    bot_pending.len()
-                )),
-                Err(e) => log(&format!("⚠️  武装恢复 cron 失败: {e}")),
-            }
-        }
-    } else if armed {
-        match crate::goal_wake::set_cron_armed(db, cron_id, false) {
-            Ok(_) => log("恢复已完成，解除武装「目标恢复值守」cron（不再消耗 token）"),
-            Err(e) => log(&format!("⚠️  解除武装恢复 cron 失败: {e}")),
-        }
-    }
-}
-
-/// 唤醒一个目标：**只写「恢复请求」文件**，由 Host 内的 cron 去 `session send`。
+/// 唤醒一个目标：**只写「恢复请求」文件**，由 Host 内的 MiniApp 用 `agent.run` 投递。
 ///
 /// 为什么不再往队列表投续跑消息（2026-10-19 实测后删掉）：
 /// 1. 会话活着时，目标自己的续跑循环会接着跑，**根本不需要外部唤醒**；
 /// 2. 会话空闲/已死时，空闲会话**没有调度器**去轮询队列，投进去的项永远不会被消费
 ///    （实测一条 10 月 1 日的项在队列里躺了 446 小时）；
 /// 3. 最要命的是 —— 队列里一旦有条目，这个会话就会被判为「busy」，
-///    于是 cron 的 `session send` **从「直接起回合」退化成「排到队尾」**，
+///    于是 `session send` **从「直接起回合」退化成「排到队尾」**，
 ///    反而把唯一能用的那条路给堵了。
 ///
 /// 队列投递只剩一个副作用：制造垃圾。

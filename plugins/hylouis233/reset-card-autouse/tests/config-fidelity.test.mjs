@@ -6,8 +6,14 @@
 //   2. 同类问题差点发生在 `botGuard` 上。
 //
 // ⇒ 这条测试把**每个**配置字段都过一遍：读进去、再存出来，必须一字不差。
-// 直接 import 真实模块 —— 它 import 了 ./i18n.mjs 等相对路径模块，
-// data: URL 方式无法解析相对路径。
+//
+// 2026-10-20：`resumeCronId` 已随 cron 依赖一起删除 —— 本插件不再武装任何 cron。
+// 剩下 `botGuard`（守护开关等）必须继续被完整保留。
+import { readFileSync } from 'node:fs';
+
+const src = readFileSync(new URL('../miniapp/node/server.mjs', import.meta.url), 'utf8');
+// 直接 import 真实模块：它的相对 import（./bot_wakeup.mjs）由 Node 自己解析。
+// ⚠️ 不能用 data: URL 导入 —— 那样解析不了相对路径（ERR_UNSUPPORTED_RESOLVE_REQUEST）。
 const mod = await import('../miniapp/node/server.mjs');
 
 let pass = 0;
@@ -24,7 +30,6 @@ const full = {
   cardSkipBeforeResetMinutes: 45,
   quotaLevels: { tight: 82, low: 96 },
   goalPause: { enabled: true, triggerPercent: 93, resumeAtPercent: 3 },
-  resumeCronId: 'cf98b82e-306b-490c-9e27-141ee44fab40',
   botGuard: { enabled: true, idleMs: 120000, backoffBaseMs: 7000, backoffCapMs: 45000 },
 };
 
@@ -38,7 +43,6 @@ for (const key of [
   'cardSkipBeforeResetMinutes',
   'quotaLevels',
   'goalPause',
-  'resumeCronId',
   'botGuard',
 ]) {
   const got = JSON.stringify(c[key]);
@@ -55,8 +59,16 @@ for (const key of ['enabled', 'idleMs', 'backoffBaseMs', 'backoffCapMs']) {
 
 console.log('\n=== 缺字段时用默认值，而不是丢字段 ===');
 const c2 = mod.normalizeConfig({ cardTriggerPercent: 90 }).config;
-check('缺失时 resumeCronId 存在', typeof c2.resumeCronId === 'string');
 check('缺失时 botGuard 存在且默认关闭', c2.botGuard && c2.botGuard.enabled === false);
+
+console.log('\n=== cron 依赖已彻底删除 ===');
+check('配置里不再有 resumeCronId', !('resumeCronId' in c));
+// 源码里可以提到这个词（注释说明为什么删），但**不能**再有代码引用它。
+const codeOnly = src
+  .split('\n')
+  .filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l))
+  .join('\n');
+check('代码里不再引用 resumeCronId', !/resumeCronId/.test(codeOnly));
 
 console.log('\n=== 非法值被夹到合法区间（不静默通过）===');
 const c3 = mod.normalizeConfig({ botGuard: { enabled: true, idleMs: 1, backoffCapMs: 99999999 } }).config;
