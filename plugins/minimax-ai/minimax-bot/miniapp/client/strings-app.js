@@ -131,6 +131,8 @@ export default {
     'note.errorAfterRetry': '自动重试了 {n} 次还是没成功：{error}',
     'note.retry': '重试',
     'live.retrying': '模型这会儿有点忙，{s} 秒后再试一次（{n}/{max}）',
+    // 暂时性错误走**无限重试**（2026-10-19）：没有次数上限，所以不显示 n/max。
+    'live.retryingForever': '服务暂时不可用，{s} 秒后自动重试（第 {n} 次）',
     'note.unknownError': '未知错误',
     'note.aborted': '已停止',
     'note.interrupted': 'Mini App 重启了，这一轮被中断',
@@ -402,6 +404,8 @@ export default {
     'note.errorAfterRetry': 'Still failed after retrying {n} time(s): {error}',
     'note.retry': 'Retry',
     'live.retrying': 'The model is busy right now; trying again in {s}s ({n}/{max})',
+    // Transient failures retry forever (2026-10-19): no attempt cap, so no n/max.
+    'live.retryingForever': 'The service is temporarily unavailable; retrying in {s}s (attempt {n})',
     'note.unknownError': 'Unknown error',
     'note.aborted': 'Stopped',
     'note.interrupted': 'The Mini App restarted and interrupted this turn',

@@ -28,6 +28,31 @@ Copy this directory, including the hidden `.minimax-plugin/` directory, into the
 - **Language**: English and Chinese. By default it follows the operating system's preferred language (the first English or Chinese entry in `navigator.languages`; other languages fall back to English), or you can fix it under Settings → General → Language. The interface, errors, system notices, Chief's default setup, the context Bots receive and the MCP tool descriptions all switch; replies the Bots wrote and text you entered stay as they are.
 - **Reactions**: react to finished Bot replies in private and group chats. The quick bar offers 👍 ❤️ 🙌 😂 😭 😮, and more emoji can be browsed by category or searched in English or Chinese. Each message holds one reaction: picking a new one replaces it, and picking the same one again removes it. Reactions are saved locally, survive refreshes and restarts, and sync to other open windows. They do not trigger a Bot reply and are not sent to the model.
 
+## 0.7.4 Transient failures retry until they succeed
+
+A Bot that died from a **temporary** failure now comes back on its own.
+
+The Host classifies a generic 5xx as `LLM_UPSTREAM_ERROR` (50113) and deliberately
+fails closed on it: that code is a catch-all bucket for *any* status of 400 or above
+except 402/401/403/429/529, so retrying it could turn an HTTP 400 or 404 into ten
+identical attempts. The result is that a plain HTTP 500 — which usually clears on
+its own within seconds — kills the turn on the first try.
+
+This plugin sees the error **message**, so it can tell the two apart. Failures that
+name a transient condition are retried until they succeed, with an exponential
+backoff capped at 60 seconds:
+
+| Error | Behaviour |
+| --- | --- |
+| `net::ERR_NETWORK_CHANGED`, connection reset, timeout | Retried until it succeeds |
+| `Internal server error (500)`, `502 Bad Gateway`, `520` | Retried until it succeeds |
+| The model is busy, rate limited, overloaded | Retried until it succeeds |
+| `Token Plan` limit reached, credits exhausted, login expired | **Not retried** — only topping up fixes it |
+| HTTP 400 / 404 and other rejections | **Not retried** — the server already refused the request |
+
+The waiting Bot shows how long it will wait and how many attempts it has made.
+Stopping the Bot or restarting the Mini App ends the wait immediately.
+
 ## 0.7.0 Reliable delegation and result delivery
 
 Chat with your Bot as usual. It can ask other Bots for help while you keep chatting; completed results return here, and you can stop the work at any time.

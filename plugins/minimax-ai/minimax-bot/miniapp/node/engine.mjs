@@ -37,6 +37,63 @@ const TURN_RETRY_DELAYS_MS = [8000, 20000];
 /** Failure reasons a retry cannot fix; anything else (or no reason from an older Host) may be retried. */
 const NO_RETRY_REASONS = new Set(['auth', 'quota', 'context_too_long', 'blocked', 'invalid_request']);
 
+/**
+ * 无限重试：暂时性错误一直重试，直到成功。
+ *
+ * 2026-10-19 实测补。起因是 Host 的 `toLLMRetryDecision()` 对**通用 5xx**
+ * 故意 fail-closed —— `LLM_UPSTREAM_ERROR`（50113）是「400 及以上的兜底桶」，
+ * 把 HTTP 400/404 这种重试无意义的错误和 HTTP 500 这种**暂时性**错误混在一起，
+ * 于是分类器只能整体判成不可重试。
+ * Host 的注释说得很清楚：*would turn an HTTP 400 or 404 into ten identical attempts*。
+ *
+ * 但本插件**能看到错误消息文本**，而实测这批 50113 全部是暂时性故障：
+ *   net::ERR_NETWORK_CHANGED / Internal server error (500) / 请求处理超时 (2066)
+ *   / unknown error, 520 / open platform service unavailable / 502 Bad Gateway
+ * ⇒ 在这里按消息文本把它们与「确定性失败」分开。
+ *
+ * ⚠️ 仍**不重试**的：400/404/422 这类「服务端已明确拒绝」的错误
+ *   （重试十次还是同样结果），以及额度/鉴权类（见 NO_RETRY_REASONS）。
+ */
+const TRANSIENT_ERROR_PATTERNS = [
+  /net::ERR_NETWORK_CHANGED/i,
+  /ERR_NETWORK/i,
+  /ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE/i,
+  /socket hang up/i,
+  /internal server error/i,
+  /\b50[0234]\b/,
+  /bad gateway|gateway timeout|service unavailable/i,
+  /open platform service unavailable/i,
+  /请求处理超时/,
+  /unknown error, *520/,
+  /overloaded|rate limit|too many requests|model is busy/i,
+];
+
+/**
+ * 这条错误消息是不是「暂时性」的（重试有意义）。
+ *
+ * @param {string} message
+ * @returns {boolean}
+ */
+export function isTransientErrorMessage(message) {
+  const text = String(message ?? '');
+  if (!text) return false;
+  return TRANSIENT_ERROR_PATTERNS.some((re) => re.test(text));
+}
+
+/**
+ * 无限重试的退避：指数增长 + 抖动，**封顶** `TURN_RETRY_CAP_MS`。
+ *
+ * 封顶是必须的：不封顶则第 40 次要等 12 天，等于没有重试。
+ * 抖动也是必须的：否则并发重试会形成「惊群」，同时打在同一时刻。
+ */
+const TURN_RETRY_CAP_MS = 60_000;
+const TURN_RETRY_BASE_MS = 8_000;
+
+export function turnRetryDelayMs(attempt, baseMs = TURN_RETRY_BASE_MS, capMs = TURN_RETRY_CAP_MS) {
+  const exp = Math.min(baseMs * 2 ** Math.max(0, attempt - 1), capMs);
+  return exp + Math.floor(Math.random() * 1000);
+}
+
 /** Resolves true after `ms`, or false at once if `signal` aborts first. */
 function sleepUnlessAborted(ms, signal) {
   return new Promise((resolve) => {
@@ -130,6 +187,9 @@ export class Engine {
     this.logger = deps.logger;
     /** Waits before each automatic retry of a failed turn (tests shorten them). */
     this.retryDelays = deps.retryDelaysMs ?? TURN_RETRY_DELAYS_MS;
+    /** 无限重试的退避基数与上限（测试会把它调小）。 */
+    this.retryBaseMs = deps.retryBaseMs ?? TURN_RETRY_BASE_MS;
+    this.retryCapMs = deps.retryCapMs ?? TURN_RETRY_CAP_MS;
     /** @type {{ at: number, value: Promise<any> } | undefined} */
     this.catalogCache = undefined;
     /** @type {Map<string, { controller: AbortController, stoppedBy?: string }>} helper id -> run */
@@ -505,6 +565,10 @@ export class Engine {
     let failure = '';
     let failureCode = '';
     let failureRetryable = false;
+    // 原始错误消息（未翻译）：暂时性错误的判定必须看**它**——
+    // `failure` 是 `describeAgentError()` 翻译后的文案（可能是「模型不可用」这类
+    // 泛化说法），里面已经没有 500 / 网络切换这些关键信息了。
+    let rawFailureMessage = '';
     let attempt = 0;
     try {
       for (;;) {
@@ -536,31 +600,75 @@ export class Engine {
               failure = describeAgentError(retryError);
               failureCode = errorCode(retryError);
               failureRetryable = Boolean(/** @type {any} */ (retryError)?.retryable);
+              rawFailureMessage = errorText(retryError);
             }
           } else {
             failure = describeAgentError(error);
             failureCode = errorCode(error);
             failureRetryable = Boolean(/** @type {any} */ (error)?.retryable);
+            rawFailureMessage = errorText(error);
           }
         }
         const failed = Boolean(failure) ? failureRetryable : result?.status === 'error';
         const reason = result?.error?.reason;
+        // ── 两条重试路径（2026-10-19 实测补）──
+        //
+        // A) **暂时性错误 ⇒ 无限重试**。
+        //    Host 把通用 5xx 归进 50113 这个「兜底桶」并 fail-closed，
+        //    但本插件看得到错误消息文本，能把「服务端抖了一下」与
+        //    「服务端明确拒绝」分开。实测这批 50113 全是暂时性故障
+        //    （网络切换 / 500 / 超时 / 520 / 502 / 服务不可用）。
+        //    ⇒ 一直重试到成功，退避封顶 60 秒。
+        //
+        // B) **其它可重试错误 ⇒ 有限重试**（原有行为，2 次 / 28 秒窗口）。
+        //
+        // 两条路都排除：额度类（quota）、鉴权类（auth）、上下文过长、被拒、
+        // 参数非法 —— 这些重试一万次也没用。
+        // ⚠️ 成功后必须**立刻停止**重试。
+        // `rawFailureMessage` 保留着上一次失败的内容，而 `transient` 只看它 ——
+        // 于是第 4 次已经 `result.status === 'finished'` 了，却因为「上一次是
+        // 暂时性错误」而继续重试（实测 attempts 从 4 一路涨到 7，永远停不下来）。
+        // ⇒ 判据必须先看**本次**的结果是否成功。
+        const succeeded = result?.status === 'finished';
+        const transient =
+          !succeeded &&
+          isTransientErrorMessage(result?.error?.message ?? rawFailureMessage ?? '');
+        // ⚠️ 抛异常的路径里 `result` 是 undefined，所以不能用 `result?.status`。
+        // 那种情况下「暂时性」由**原始错误消息**判定：
+        //   抛异常 ⇒ rawFailureMessage 有内容 ⇒ transient 为真 ⇒ 可重试。
+        const retryableFailure =
+          failed ||
+          (transient &&
+            !NO_RETRY_REASONS.has(reason) &&
+            reason !== 'auth' &&
+            reason !== 'quota');
         const canRetry =
-          failed &&
+          retryableFailure &&
           !input.answer &&
           !toolStarted &&
-          attempt < this.retryDelays.length &&
+          (transient || attempt < this.retryDelays.length) &&
           !controller.signal.aborted &&
           !this.disposed &&
-          result?.error?.retryable !== false &&
+          (transient || result?.error?.retryable !== false) &&
           !NO_RETRY_REASONS.has(reason);
         if (!canRetry) break;
-        const delay = this.retryDelays[attempt];
+        // 暂时性错误用封顶退避；其它用原来的固定窗口。
+        const delay = transient
+          ? turnRetryDelayMs(attempt + 1, this.retryBaseMs, this.retryCapMs)
+          : this.retryDelays[attempt];
         attempt += 1;
         // Words the failed attempt streamed are not the reply; the retry writes its own.
         message.parts = message.parts.filter((part) => part.type !== 'text');
         liveText = undefined;
-        message.live = { key: 'live.retrying', params: { s: Math.round(delay / 1000), n: attempt + 1, max: this.retryDelays.length + 1 } };
+        message.live = {
+          key: 'live.retrying',
+          params: {
+            s: Math.round(delay / 1000),
+            n: attempt + 1,
+            // 暂时性错误没有次数上限，所以不报 max。
+            max: transient ? 0 : this.retryDelays.length + 1,
+          },
+        };
         flush(true);
         const waited = await sleepUnlessAborted(delay, controller.signal);
         message.live = undefined;
