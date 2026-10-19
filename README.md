@@ -62,6 +62,7 @@ The MiniMax Code Agent communicates through the host MCP client. Business reques
 | MiniApp | What it does | Author |
 | --- | --- | --- |
 | [AI Office](plugins/cristinamadureira353-svg/ai-office/) | Manage five model-powered employees in a pixel office: client tasks, chats, breaks, meetings and quota-aware offline states; uses your own API keys | [最爱双皮奶](https://github.com/cristinamadureira353-svg) |
+| [蹬王之王 · Reset Card Auto-Use](plugins/hylouis233/reset-card-autouse/) | Track credit and reset-card expiry, pause goals when the 5-hour quota runs out, and resume them once it comes back — a headless daemon plus a live dashboard | [Hylouis](https://github.com/Hylouis233) |
 | [Token Usage Board](plugins/amszuidas/mcode-token-usage-board/) | Explore local Token usage by date, model, and session, including input, output, and cache usage | [amszuidas](https://github.com/amszuidas) |
 | [Token Usage Board](plugins/yanhy2000/mcode-usage-monitor/) | Watch local Token usage, output speed, and cache hit rate in near real time; filter by time range, model, and session | [yanhy2000](https://github.com/yanhy2000) |
 | [Model Manager](plugins/ocoomber/openrouter-model-manager/) | Browse, search, and enable/disable models in your `~/.minimax/config.yaml` with instant save, bulk actions, one-click undo, and automatic backups | [ocoomber](https://github.com/ocoomber) |
