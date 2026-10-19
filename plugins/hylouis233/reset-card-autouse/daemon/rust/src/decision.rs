@@ -1,6 +1,6 @@
 //! 额度与到期判定。
 //!
-//! 这些分支与 Mini App「蹬王之王」的 `decide()` 一一对应，
+//! 这些分支与 Mini App「蹬王之王」的 `decide(, true)` 一一对应，
 //! 由 `verify-parity.mjs` 逐字比对「动作 + 理由文本」来防止漂移。
 //! **改动任何一条理由文案，两侧都要同步改，并重跑校验器。**
 
@@ -294,7 +294,7 @@ pub struct Decision {
     pub reason: String,
 }
 
-/// `decide()` 需要的判定参数。默认值对应 config.json 缺失时的兜底。
+/// `decide(, true)` 需要的判定参数。默认值对应 config.json 缺失时的兜底。
 #[derive(Debug, Clone, Copy)]
 pub struct DecisionCfg {
     pub card_trigger_percent: f64,
@@ -391,13 +391,21 @@ pub fn minutes_to_reset(q: Option<&QuotaState>, now_ms: i64) -> Option<f64> {
 ///
 /// 动作 ∈ {use-card, keep-credit, idle, wait}。
 ///
-/// 分支与 Mini App 的 `decide()` 刻意同构：
+/// 分支与 Mini App 的 `decide(, true)` 刻意同构：
 ///   未耗尽                  → idle
 ///   耗尽 + 无积分 + 有卡     → use-card
 ///   耗尽 + 无积分 + 无卡     → wait
 ///   耗尽 + 有积分 + 无卡     → keep-credit
 ///   耗尽 + 都有，卡先过期    → use-card
 ///   耗尽 + 都有，积分先过期  → keep-credit
+///
+/// `credit_data_complete` 表示「积分数据是否**完整读到**」。
+///
+/// ⚠️ 2026-10-19 PR #28 review 修：读不到 ≠ 没有。
+/// `credit_expiry_ms = None` 同时可能表示「确实没有积分」与「接口读失败」，
+/// 以前两者都落到 `use-card` 分支 —— 而扣卡是**真实写操作**，
+/// 于是网络故障会被当成业务状态，可能误扣真卡。
+/// ⇒ 数据不完整时一律**不做写操作**（`Action::Wait`），只如实报出来。
 pub fn decide(
     quotas: &[QuotaState],
     usable_cards: &[UsableCard],
@@ -405,6 +413,7 @@ pub fn decide(
     credit_desc: &str,
     cfg: &DecisionCfg,
     now_ms: i64,
+    credit_data_complete: bool,
 ) -> Decision {
     let five = quotas.iter().find(|q| q.quota_type == QUOTA_FIVE_HOUR);
     let weekly = quotas.iter().find(|q| q.quota_type == QUOTA_WEEKLY);
@@ -441,6 +450,15 @@ pub fn decide(
                 five.map(|q| q.used).unwrap_or(0.0),
                 cfg.card_trigger_percent
             ),
+        };
+    }
+
+    // ── 积分数据没读全 ⇒ 无法判断「卡先过期还是积分先过期」──
+    // ⇒ 绝不做写操作（扣卡是真实消耗，宁可等下一轮）。
+    if !credit_data_complete {
+        return Decision {
+            action: Action::Wait,
+            reason: "积分数据读取不完整，本轮不执行写操作（等下一轮重新判定）".to_string(),
         };
     }
 
@@ -550,21 +568,21 @@ mod tests {
 
         // 刷新在 2 小时后 → 照常用卡
         quotas[0].reset_time_ms = Some(NOW + 120 * 60_000);
-        assert_eq!(decide(&quotas, &[c(7)], credit, "平台积分", &cfg, NOW).action, Action::UseCard);
+        assert_eq!(decide(&quotas, &[c(7)], credit, "平台积分", &cfg, NOW, true).action, Action::UseCard);
 
         // 刷新在 10 分钟后 → 不烧卡，等它自己刷新
         quotas[0].reset_time_ms = Some(NOW + 10 * 60_000);
-        let d = decide(&quotas, &[c(7)], credit, "平台积分", &cfg, NOW);
+        let d = decide(&quotas, &[c(7)], credit, "平台积分", &cfg, NOW, true);
         assert_eq!(d.action, Action::Wait, "额度马上要刷新，不该烧重置卡");
         assert!(d.reason.contains("分钟后刷新"), "理由要说清为什么不动: {}", d.reason);
 
         // 窗口设为 0 → 关闭该保护，照常烧卡
         let no_skip = DecisionCfg { card_skip_before_reset_minutes: 0.0, ..Default::default() };
-        assert_eq!(decide(&quotas, &[c(7)], credit, "平台积分", &no_skip, NOW).action, Action::UseCard);
+        assert_eq!(decide(&quotas, &[c(7)], credit, "平台积分", &no_skip, NOW, true).action, Action::UseCard);
 
         // 窗口放大到 180 分钟 → 10 分钟后刷新也跳过
         let wide = DecisionCfg { card_skip_before_reset_minutes: 180.0, ..Default::default() };
-        assert_eq!(decide(&quotas, &[c(7)], credit, "平台积分", &wide, NOW).action, Action::Wait);
+        assert_eq!(decide(&quotas, &[c(7)], credit, "平台积分", &wide, NOW, true).action, Action::Wait);
     }
 
     #[test]
@@ -594,16 +612,16 @@ mod tests {
         let week_dead = vec![q(1, 100.0, 50.0, false), q(2, 100.0, 100.0, false)];
         let credit = Some(1_700_000_000_000 + 13 * 86_400_000);
 
-        assert_eq!(decide(&five_ok, &[c(7)], credit, "平台积分", &cfg, NOW).action, Action::Idle);
-        assert_eq!(decide(&five_dead, &[c(7)], credit, "平台积分", &cfg, NOW).action, Action::UseCard);
-        assert_eq!(decide(&five_dead, &[], credit, "平台积分", &cfg, NOW).action, Action::KeepCredit);
-        assert_eq!(decide(&five_dead, &[], None, "", &cfg, NOW).action, Action::Wait);
-        assert_eq!(decide(&five_dead, &[c(7)], None, "", &cfg, NOW).action, Action::UseCard);
-        assert_eq!(decide(&week_dead, &[c(7)], credit, "平台积分", &cfg, NOW).action, Action::UseCard);
+        assert_eq!(decide(&five_ok, &[c(7)], credit, "平台积分", &cfg, NOW, true).action, Action::Idle);
+        assert_eq!(decide(&five_dead, &[c(7)], credit, "平台积分", &cfg, NOW, true).action, Action::UseCard);
+        assert_eq!(decide(&five_dead, &[], credit, "平台积分", &cfg, NOW, true).action, Action::KeepCredit);
+        assert_eq!(decide(&five_dead, &[], None, "", &cfg, NOW, true).action, Action::Wait);
+        assert_eq!(decide(&five_dead, &[c(7)], None, "", &cfg, NOW, true).action, Action::UseCard);
+        assert_eq!(decide(&week_dead, &[c(7)], credit, "平台积分", &cfg, NOW, true).action, Action::UseCard);
         // 积分更早过期 → 不用卡
         let credit_soon = Some(1_700_000_000_000 + 2 * 86_400_000);
         assert_eq!(
-            decide(&five_dead, &[c(20)], credit_soon, "平台积分", &cfg, NOW).action,
+            decide(&five_dead, &[c(20)], credit_soon, "平台积分", &cfg, NOW, true).action,
             Action::KeepCredit
         );
     }
@@ -617,12 +635,12 @@ mod tests {
         let strict = DecisionCfg { card_trigger_percent: 99.0, ..Default::default() };
         let loose = DecisionCfg { card_trigger_percent: 90.0, ..Default::default() };
         assert_eq!(
-            decide(&quotas, &[c(7)], credit_soon, "平台积分", &strict, NOW).action,
+            decide(&quotas, &[c(7)], credit_soon, "平台积分", &strict, NOW, true).action,
             Action::Idle,
             "95% 未到 99% 触发线，应保持 idle"
         );
         assert_eq!(
-            decide(&quotas, &[c(7)], credit_soon, "平台积分", &loose, NOW).action,
+            decide(&quotas, &[c(7)], credit_soon, "平台积分", &loose, NOW, true).action,
             Action::KeepCredit,
             "阈值放宽到 90% 后应越过触发线，进入先过期先用判定"
         );
@@ -650,15 +668,15 @@ mod tests {
     fn idle_reason_follows_level() {
         let cfg = DecisionCfg::default();
         // 92% 不能再写「额度充足」——那是误导
-        let d92 = decide(&vec![q(1, 100.0, 92.0, false), q(2, 100.0, 0.0, true)], &[], Some(1), "平台积分", &cfg, NOW);
+        let d92 = decide(&vec![q(1, 100.0, 92.0, false), q(2, 100.0, 0.0, true)], &[], Some(1), "平台积分", &cfg, NOW, true);
         assert_eq!(d92.action, Action::Idle);
         assert!(d92.reason.starts_with("额度紧张"), "{}", d92.reason);
         assert!(d92.reason.contains("92%"), "{}", d92.reason);
 
-        let d12 = decide(&vec![q(1, 100.0, 12.0, false), q(2, 100.0, 0.0, true)], &[], Some(1), "平台积分", &cfg, NOW);
+        let d12 = decide(&vec![q(1, 100.0, 12.0, false), q(2, 100.0, 0.0, true)], &[], Some(1), "平台积分", &cfg, NOW, true);
         assert!(d12.reason.starts_with("额度充足"), "{}", d12.reason);
 
-        let d97 = decide(&vec![q(1, 100.0, 97.0, false), q(2, 100.0, 0.0, true)], &[], Some(1), "平台积分", &cfg, NOW);
+        let d97 = decide(&vec![q(1, 100.0, 97.0, false), q(2, 100.0, 0.0, true)], &[], Some(1), "平台积分", &cfg, NOW, true);
         assert!(d97.reason.starts_with("额度不足"), "{}", d97.reason);
     }
 
@@ -666,7 +684,7 @@ mod tests {
     fn burned_never_appears_in_idle_reason() {
         // burned 必然已 triggered，走用卡/留卡分支，不该出现在 idle 理由里
         let cfg = DecisionCfg { card_trigger_percent: 100.0, ..Default::default() };
-        let d = decide(&vec![q(1, 100.0, 100.0, false), q(2, 100.0, 0.0, true)], &[c(7)], Some(1_700_000_000_000), "平台积分", &cfg, NOW);
+        let d = decide(&vec![q(1, 100.0, 100.0, false), q(2, 100.0, 0.0, true)], &[c(7)], Some(1_700_000_000_000), "平台积分", &cfg, NOW, true);
         assert_ne!(d.action, Action::Idle);
         assert!(!d.reason.contains("额度燃尽"), "{}", d.reason);
     }
@@ -675,8 +693,41 @@ mod tests {
     fn reasons_are_filled() {
         let cfg = DecisionCfg::default();
         let five_dead = vec![q(1, 100.0, 100.0, false), q(2, 100.0, 0.0, true)];
-        let d = decide(&five_dead, &[], Some(1_700_000_000_000 + 13 * 86_400_000), "平台积分", &cfg, NOW);
+        let d = decide(&five_dead, &[], Some(1_700_000_000_000 + 13 * 86_400_000), "平台积分", &cfg, NOW, true);
         assert!(d.reason.contains("没有可用的重置卡"), "{}", d.reason);
         assert!(d.reason.contains("平台积分"), "{}", d.reason);
+    }
+
+    /// 回归测试：积分数据读取失败时**绝不扣卡**。
+    ///
+    /// ⚠️ 2026-10-19 PR #28 review 修：读不到 ≠ 没有。
+    /// `credit_expiry_ms = None` 同时可能表示「确实没有积分」与「接口读失败」，
+    /// 以前两者都落到 `use-card` —— 而扣卡是真实写操作，
+    /// 网络故障会被当成业务状态，可能误扣真卡。
+    #[test]
+    fn incomplete_credit_data_never_spends_a_card() {
+        let cfg = DecisionCfg::default();
+        // 额度已耗尽，有一张卡，但积分数据**没读全**
+        let quotas = vec![q(1, 100.0, 100.0, false)];
+        let cards = vec![c(7)];
+        let d = decide(&quotas, &cards, None, "", &cfg, NOW, false);
+        assert_eq!(
+            d.action,
+            Action::Wait,
+            "积分数据不完整时必须 wait，不能用卡"
+        );
+        assert!(
+            d.reason.contains("读取不完整"),
+            "理由要如实说明数据不完整: {}",
+            d.reason
+        );
+
+        // 对照：同样条件下，数据完整 ⇒ 确实没有积分 ⇒ 可以用卡
+        let d2 = decide(&quotas, &cards, None, "", &cfg, NOW, true);
+        assert_eq!(
+            d2.action,
+            Action::UseCard,
+            "数据完整且确实无积分时，用卡是正确的"
+        );
     }
 }

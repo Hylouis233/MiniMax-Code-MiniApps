@@ -8,11 +8,11 @@ const mod = await import(
   'data:text/javascript;base64,' +
     Buffer.from(
       body +
-        '\nexport { percent, amount, parsePlatformPools, parseCodeCredits, parseQuota, expiringWithin, decide };',
+        '\nexport { percent, amount, parsePlatformPools, parseCodeCredits, parseQuota, expiringWithin, decide, isRetryableStatus, retryDelayMs, RETRY_CAP_MS };',
     ).toString('base64')
 );
 
-const { decide, percent, amount, parsePlatformPools, parseCodeCredits, parseQuota, expiringWithin } = mod;
+const { decide, percent, amount, parsePlatformPools, parseCodeCredits, parseQuota, expiringWithin, isRetryableStatus, retryDelayMs, RETRY_CAP_MS } = mod;
 
 // 用真实当前时间：写死日期会让整组用例随日历推移而失效
 const NOW = Date.now();
@@ -137,6 +137,154 @@ total += 1;
 const usesUnwrap = /fetchCodeCredits\(token\)[\s\S]{0,80}?\.then\(\(r\) => r\.payload\)/.test(src2);
 if (usesUnwrap) pass += 1;
 console.log(`${usesUnwrap ? '  PASS' : '  FAIL'}  buildSnapshot 解包 fetchCodeCredentials().payload`);
+
+
+console.log('\n=== PR #28 review 回归：读不到 ≠ 没有 ===');
+// 建议 2：`credit/details` 失败时，decide 必须**不做写操作**。
+// 之前失败被当成「没有积分」⇒ 结论从「留卡」翻转成「用卡」，
+// 而扣卡是真实写操作 ⇒ 网络故障会导致误扣真卡。
+{
+  const now = Date.now();
+  const soon = now + 3 * D;
+  const far = now + 40 * D;
+  const quotaUsed = {
+    fiveHour: {
+      usedPercent: 100,
+      totalPercent: 100,
+      unlimited: false,
+      triggered: true,
+      exhausted: true,
+      // 远离「临近刷新不烧卡」的阈值（默认 60 分钟），
+      // 否则这条用例测到的是 skip 分支而不是「卡先过期」分支。
+      resetTimeMs: now + 6 * 60 * 60_000,
+    },
+    weekly: {
+      usedPercent: 100,
+      totalPercent: 100,
+      unlimited: false,
+      triggered: true,
+      exhausted: true,
+      resetTimeMs: now + 6 * 60 * 60_000,
+    },
+  };
+  const card = { cardId: 'c1', sourceType: 'st', outBizNo: 'ob1', expireTimeMs: soon, expired: false };
+  const credit = {
+    kind: 'code-credit',
+    source: 'code',
+    label: 'Code 积分·赠送',
+    granted: 100,
+    consumed: 0,
+    balance: 100,
+    expireTimeMs: far,
+    expired: false,
+  };
+  // 完整数据：卡比积分先过期 ⇒ use-card
+  const full = decide(
+    { platformPools: [], codeCredits: [credit], cards: [card], quota: quotaUsed, creditDataComplete: true },
+    now,
+  );
+  total += 1;
+  if (full.action === 'use-card') pass += 1;
+  console.log(`${full.action === 'use-card' ? '  PASS' : '  FAIL'}  数据完整时：卡先过期 ⇒ use-card`);
+
+  // 数据不完整（积分读失败）：即使有卡也不能执行写操作
+  const partial = decide(
+    { platformPools: [], codeCredits: [], cards: [card], quota: quotaUsed, creditDataComplete: false },
+    now,
+  );
+  total += 1;
+  if (partial.action === 'wait' && partial.usedCard === false) pass += 1;
+  console.log(
+    `${partial.action === 'wait' && partial.usedCard === false ? '  PASS' : '  FAIL'}  积分数据不完整 ⇒ wait（不做写操作）`,
+  );
+  total += 1;
+  if (partial.reason.includes('读取不完整')) pass += 1;
+  console.log(`${partial.reason.includes('读取不完整') ? '  PASS' : '  FAIL'}  理由如实说明「读取不完整」`);
+}
+
+console.log('\n=== PR #28 review 回归：cards.raw 带 cardId ===');
+// 建议 1：页面用的 cards.items 是脱敏视图（无 cardId），
+// 拿它做「卡还在不在列表里」的判断 ⇒ 恒为 false ⇒ 扣卡永远被跳过。
+{
+  const src3 = readFileSync(new URL('../miniapp/node/server.mjs', import.meta.url), 'utf8');
+  total += 1;
+  const hasRaw = /raw:\s*cards[\s\S]{0,200}cardId:\s*c\.cardId/.test(src3);
+  if (hasRaw) pass += 1;
+  console.log(`${hasRaw ? '  PASS' : '  FAIL'}  快照里带 cardId 的原始列表 cards.raw`);
+
+  total += 1;
+  const usesRaw = /stillListed[\s\S]{0,120}?cards\.raw/.test(src3);
+  if (usesRaw) pass += 1;
+  console.log(`${usesRaw ? '  PASS' : '  FAIL'}  stillListed 判定改用 cards.raw（不再用无 cardId 的 items）`);
+
+  total += 1;
+  const notUsingItems = !/stillListed[\s\S]{0,120}?cards\.items/.test(src3);
+  if (notUsingItems) pass += 1;
+  console.log(`${notUsingItems ? '  PASS' : '  FAIL'}  不再用 cards.items 做卡存在性判定`);
+}
+
+
+console.log('\n=== 无限重试：可重试错误码判定 ===');
+// 2026-10-19 新增：遇到 500（内部错误）与 429（负载过高）应一直重试；
+// 401/403（登录态失效）与其他 4xx 是确定性失败，必须快速失败。
+{
+  for (const code of [429, 500, 502, 503, 504]) {
+    total += 1;
+    const ok = isRetryableStatus(code);
+    if (ok) pass += 1;
+    console.log(`${ok ? '  PASS' : '  FAIL'}  HTTP ${code} 可重试`);
+  }
+  for (const code of [400, 401, 403, 404, 422]) {
+    total += 1;
+    const ok = !isRetryableStatus(code);
+    if (ok) pass += 1;
+    console.log(`${ok ? '  PASS' : '  FAIL'}  HTTP ${code} 不可重试（快速失败）`);
+  }
+}
+
+console.log('\n=== 无限重试：退避必须封顶 ===');
+// 否则「无限重试」会指数增长到没有尽头，且把接口打爆。
+{
+  const d1 = retryDelayMs(1);
+  const d5 = retryDelayMs(5);
+  const d50 = retryDelayMs(50);
+  const d1000 = retryDelayMs(1000);
+  total += 1;
+  if (d5 > d1) pass += 1;
+  console.log(`${d5 > d1 ? '  PASS' : '  FAIL'}  退避随次数增长（d1=${d1} d5=${d5}）`);
+
+  total += 1;
+  if (d50 <= RETRY_CAP_MS + 500) pass += 1;
+  console.log(`${d50 <= RETRY_CAP_MS + 500 ? '  PASS' : '  FAIL'}  退避封顶在 cap+抖动（d50=${d50} cap=${RETRY_CAP_MS}）`);
+
+  total += 1;
+  if (d1000 <= RETRY_CAP_MS + 500) pass += 1;
+  console.log(`${d1000 <= RETRY_CAP_MS + 500 ? '  PASS' : '  FAIL'}  无限次重试也不超 cap（d1000=${d1000}）`);
+}
+
+console.log('\n=== 无限重试：只对可重试错误重试 ===');
+{
+  const src4 = readFileSync(new URL('../miniapp/node/server.mjs', import.meta.url), 'utf8');
+  total += 1;
+  const hasHelper = /async function fetchWithRetry/.test(src4);
+  if (hasHelper) pass += 1;
+  console.log(`${hasHelper ? '  PASS' : '  FAIL'}  存在 fetchWithRetry 辅助函数`);
+
+  total += 1;
+  const getUses = /async function apiGet[\s\S]{0,300}?fetchWithRetry/.test(src4);
+  if (getUses) pass += 1;
+  console.log(`${getUses ? '  PASS' : '  FAIL'}  apiGet 走 fetchWithRetry`);
+
+  total += 1;
+  const postUses = /async function apiPost[\s\S]{0,400}?fetchWithRetry/.test(src4);
+  if (postUses) pass += 1;
+  console.log(`${postUses ? '  PASS' : '  FAIL'}  apiPost 走 fetchWithRetry`);
+
+  total += 1;
+  const cardUses = /async function apiUseResetCard[\s\S]{0,400}?fetchWithRetry/.test(src4);
+  if (cardUses) pass += 1;
+  console.log(`${cardUses ? '  PASS' : '  FAIL'}  扣卡也走 fetchWithRetry（幂等键保证不重复扣）`);
+}
 
 console.log(`\n${pass}/${total} passed`);
 process.exit(pass === total ? 0 : 1);

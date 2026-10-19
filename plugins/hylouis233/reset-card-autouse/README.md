@@ -63,6 +63,51 @@ correction would make you believe a setting took effect when it did not.
 The daemon re-reads the file every cycle, so changes take effect within about a minute
 without a restart. The Mini App's “Automation thresholds” card edits the same file.
 
+## Retry policy: retryable failures are retried forever
+
+When the account API answers with a **temporary** failure, the request is retried
+until it succeeds — the dashboard does not go blank and the daemon does not treat
+a blip as "no data".
+
+| Condition | Behaviour |
+| --- | --- |
+| **429** (overloaded / rate limited) | Retried forever |
+| **500, 502, 503, 504** (internal / gateway) | Retried forever |
+| Connection reset, timeout, DNS failure | Retried forever |
+| 401 / 403 (session expired) | Token refreshed, then retried once |
+| Other 4xx | Fails fast — retrying cannot help |
+| Business errors (invalid params, quota exhausted) | Fails fast |
+
+Backoff is exponential with jitter, **capped at 60 s**: the first retry waits about
+a second, and no attempt ever waits longer than a minute, so "forever" cannot
+turn into "hammering the API". Every attempt is logged, so a stuck request always
+says what it is waiting for.
+
+Retries are **interruptible**: `SIGINT` / `SIGTERM` (what `launchctl` sends) make
+the in-flight request give up immediately, so the daemon can always be stopped
+even while it is waiting on a failing endpoint.
+
+Spending a reset card is retried too, and that is safe: the request carries
+`out_biz_no`, which the server treats as an idempotency key, so a repeated
+submission replays the result instead of consuming a second card.
+
+## Data integrity: "could not read" is not "there is none"
+
+Reading a balance is not the same as reading a balance of zero. If the credit
+endpoints fail, the previous code treated the missing data as "no credits
+available" and flipped the decision from *keep the card* to *spend the card* —
+and spending a card is a real write.
+
+Now an incomplete read is reported as incomplete, and the round performs **no
+write at all** (`wait`). The same rule applies on the daemon side: a failed
+platform-credit or Code-credit lookup marks the data incomplete instead of being
+logged and ignored.
+
+The dashboard also keeps the raw card list alongside the redacted one it
+renders. The redacted list has no `card_id`, so using it to check "is this card
+still listed?" was always false — which meant the spend call was skipped every
+single time.
+
 ## Architecture: who can do what
 
 | Actor | Pause a goal | Start a turn (resume) |

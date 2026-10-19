@@ -240,10 +240,16 @@ impl Daemon {
     }
 
     /// 全账户里最早到期的一笔「仍有效且有余额」的积分（两个来源取更早的）
-    fn earliest_credit(&mut self) -> (Option<i64>, String) {
+    fn earliest_credit(&mut self) -> (Option<i64>, String, bool) {
         let now = api::now_ms();
         let mut best: Option<i64> = None;
         let mut desc = String::new();
+        // 积分数据是否**完整读到**。
+        // ⚠️ 2026-10-19 PR #28 review 修：读不到 ≠ 没有。
+        // 以前两个来源读失败只是记日志（`best` 保持 None），于是
+        // `decide` 收到 `credit_expiry = None` ⇒ 直接走「没有积分 ⇒ 用卡」。
+        // 扣卡是真实写操作，网络故障不该导致误扣 ⇒ 任一来源读失败即视为不完整。
+        let mut complete = true;
 
         let mut consider = |exp: Option<i64>, balance: f64, label: &str| {
             let (Some(e), true) = (exp, balance > 0.0) else { return };
@@ -285,7 +291,10 @@ impl Daemon {
                     }
                 }
             }
-            Err(e) => log(&format!("  平台积分读取失败（忽略）: {e}")),
+            Err(e) => {
+                complete = false;
+                log(&format!("  平台积分读取失败（本轮不做写操作）: {e}"))
+            }
         }
 
         // Code 积分明细
@@ -316,10 +325,13 @@ impl Daemon {
                     }
                 }
             }
-            Err(e) => log(&format!("  Code 积分读取失败（忽略）: {e}")),
+            Err(e) => {
+                complete = false;
+                log(&format!("  Code 积分读取失败（本轮不做写操作）: {e}"))
+            }
         }
 
-        (best, desc)
+        (best, desc, complete)
     }
 
     /// 一轮：判定 + 必要时扣卡
@@ -336,7 +348,7 @@ impl Daemon {
             }
         };
         let usable = self.usable_cards();
-        let (credit_expiry, credit_desc) = self.earliest_credit();
+        let (credit_expiry, credit_desc, credit_data_complete) = self.earliest_credit();
 
         // ── 第 1 步：同步 Goal（失败不拖垮扣卡）──
         // 顺序固定为「先让目标停下，再决定要不要补额度」，反过来两者会打架。
@@ -371,6 +383,7 @@ impl Daemon {
             &credit_desc,
             &cfg.decision_cfg(),
             api::now_ms(),
+            credit_data_complete,
         );
         log(&format!(
             "额度: {}",
@@ -504,7 +517,13 @@ fn selftest() {
             .collect();
         let credit = c["credit"].as_i64().map(|d| now + d * day);
 
-        let d = decide(&quotas, &cards, credit, "平台积分", &cfg, now);
+        // 「积分数据是否完整」由用例给出（默认 true）——
+        // parity 校验器用它比对三方在**数据不完整**时是否都拒绝写操作。
+        let complete = c
+            .get("creditDataComplete")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let d = decide(&quotas, &cards, credit, "平台积分", &cfg, now, complete);
         let five_level = quotas[0].level(tight, low);
         out.push(serde_json::json!({
             "n": c["n"].as_str().unwrap_or(""),
@@ -517,6 +536,9 @@ fn selftest() {
 }
 
 fn main() {
+    // 「无限重试」必须可中断：装上 SIGINT / SIGTERM 处理器，
+    // 让 launchctl 能优雅停掉正卡在重试里的守护进程。
+    api::install_signal_handlers();
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--selftest") {
         selftest();
@@ -605,6 +627,11 @@ fn main() {
     // 危险状态，必须逐级喊出来，而不是每轮都被当成平常事刷过去。
     let mut fails: u32 = 0;
     loop {
+        // 收到终止信号 ⇒ 立刻退出（可能在重试循环里被置位）
+        if api::should_stop() {
+            log("收到终止信号，守护进程退出");
+            return;
+        }
         // 轮内重读配置，页面改完下一轮就生效
         let (cfg, issues) = load_cfg();
         for s in &issues {

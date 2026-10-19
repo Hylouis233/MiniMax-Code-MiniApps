@@ -849,15 +849,23 @@ def _fmt_day(ms: int | None) -> str:
     return f"{d.month}月{d.day}日"
 
 
-def earliest_credit_expiry(client: "Session | MatrixClient") -> tuple[int | None, str]:
+def earliest_credit_expiry(client: "Session | MatrixClient") -> tuple[int | None, str, bool]:
     """全账户里最早到期的一笔「仍有效且有余额」的积分。
 
     两个来源取更早的：平台积分池 + Code 积分明细。
     单个来源失败不影响另一个，宁可少算也不编造。
+
+    返回 (最早到期时刻, 来源描述, 数据是否完整)。
+
+    ⚠️ 2026-10-19 PR #28 review 修：读不到 ≠ 没有。
+    以前读取失败只是「忽略」，`best` 保持 None ⇒ 与「确实没有积分」无法区分
+    ⇒ decide 会把结论翻成「用卡」。而扣卡是**真实写操作**，
+    网络故障不该导致误扣 ⇒ 第三个返回值标记数据完整性。
     """
     now = int(time.time() * 1000)
     best: int | None = None
     desc = ""
+    complete = True
 
     def consider(exp: Any, balance: Any, label: str) -> None:
         nonlocal best, desc
@@ -877,7 +885,8 @@ def earliest_credit_expiry(client: "Session | MatrixClient") -> tuple[int | None
             consider(b.get("expire_time_ms"), _amount(b.get("balance")),
                      f"平台积分·{BUCKET_LABEL.get(b.get('source'), '未知')}")
     except Exception as exc:  # noqa: BLE001
-        log(f"  平台积分到期读取失败（忽略）: {exc}")
+        complete = False
+        log(f"  平台积分到期读取失败（本轮不做写操作）: {exc}")
 
     try:
         raw = client.call("code_credit_details") if isinstance(client, Session) else client.code_credit_details()
@@ -887,9 +896,10 @@ def earliest_credit_expiry(client: "Session | MatrixClient") -> tuple[int | None
             label = "Code 积分·赠送" if item.get("credit_type") == 2 else "Code 积分·购买"
             consider(item.get("expire_at_ms"), _amount(item.get("remaining_amount")), label)
     except Exception as exc:  # noqa: BLE001
-        log(f"  Code 积分到期读取失败（忽略）: {exc}")
+        complete = False
+        log(f"  Code 积分到期读取失败（本轮不做写操作）: {exc}")
 
-    return best, desc
+    return best, desc, complete
 
 
 def _minutes_to_reset(q: "QuotaState | None", now_ms: int) -> float | None:
@@ -909,8 +919,17 @@ def decide_background(
     credit_desc: str,
     cfg: dict[str, Any] | None = None,
     now_ms: int | None = None,
+    credit_data_complete: bool = True,
 ) -> tuple[str, str]:
     """后台扣卡决策，返回 (动作, 理由)。
+
+    `credit_data_complete` 表示「积分数据是否**完整读到**」。
+
+    ⚠️ 2026-10-19 PR #28 review 修：读不到 ≠ 没有。
+    `credit_expiry_ms = None` 同时可能表示「确实没有积分」与「接口读失败」，
+    以前两者都落到 use-card —— 而扣卡是真实写操作，
+    网络故障会被当成业务状态，可能误扣真卡。
+    ⇒ 数据不完整时一律**不做写操作**（wait），只如实报出来。
 
     动作 ∈ {"use-card", "keep-credit", "idle", "wait"}。纯函数，不触碰网络，可直接单测。
 
@@ -962,6 +981,11 @@ def decide_background(
             f"未到 {trigger:.0f}% 触发线，暂不动用重置卡"
         )
 
+    # ── 积分数据没读全 ⇒ 无法判断「卡先过期还是积分先过期」──
+    # ⇒ 绝不做写操作（扣卡是真实消耗，宁可等下一轮）。
+    if not credit_data_complete:
+        return "wait", "积分数据读取不完整，本轮不执行写操作（等下一轮重新判定）"
+
     # ── 无可用积分：只能靠卡把额度重置回来 ──
     if credit_expiry_ms is None:
         if usable_cards:
@@ -1012,11 +1036,13 @@ def background_tick(client: "Session | MatrixClient", *, dry_run: bool = False) 
     ]
     usable.sort(key=lambda c: c.get("expire_time") or float("inf"))
 
-    credit_expiry, credit_desc = earliest_credit_expiry(client)
+    credit_expiry, credit_desc, credit_data_complete = earliest_credit_expiry(client)
     cfg, cfg_issues = load_config()
     for _s in cfg_issues:
         log(f"⚠️  {_s}")
-    action, reason = decide_background(quotas, usable, credit_expiry, credit_desc, cfg, now)
+    action, reason = decide_background(
+        quotas, usable, credit_expiry, credit_desc, cfg, now, credit_data_complete
+    )
 
     log("额度: " + " | ".join(q.describe() for q in quotas))
     log(f"决策[{action}]: {reason}")

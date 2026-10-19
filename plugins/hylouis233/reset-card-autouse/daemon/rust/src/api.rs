@@ -9,6 +9,46 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// 进程是否收到过终止信号（SIGINT / SIGTERM）。
+///
+/// 「无限重试」必须**可中断** —— 否则 launchctl 想停守护进程时，
+/// 它正卡在一次无限重试的 HTTP 调用里，永远出不来。
+/// 每次重试前检查这个标志；收到信号就立刻放弃这一轮并退出。
+pub static STOPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 收到终止信号时置位。
+pub fn request_stop() {
+    STOPPED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// 是否已被要求停止。
+pub fn should_stop() -> bool {
+    STOPPED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// 安装 SIGINT / SIGTERM 处理器：第一次收到就置位停止标志。
+///
+/// 第二次信号直接退出（用户可能真的不耐烦了）。
+pub fn install_signal_handlers() {
+    unsafe extern "C" fn handler(_sig: i32) {
+        if should_stop() {
+            std::process::exit(130);
+        }
+        request_stop();
+    }
+    unsafe {
+        signal(SIGINT, handler as usize);
+        signal(SIGTERM, handler as usize);
+    }
+}
+
+const SIGINT: i32 = 2;
+const SIGTERM: i32 = 15;
+
+unsafe extern "C" {
+    fn signal(signum: i32, handler: usize) -> usize;
+}
+
 pub const BASE_CN: &str = "https://www.minimaxi.com";
 pub const BASE_GLOBAL: &str = "https://platform.minimax.io";
 pub const CODE_BASE: &str = "https://agent.minimaxi.com";
@@ -18,6 +58,92 @@ const LEASE_CAP: &str = ".minimax/run/mcode-auth-lease-v1.cap";
 
 const TOKEN_TTL_MS: u64 = 30 * 60 * 1000;
 const TOKEN_REFRESH_MARGIN_MS: u64 = 5 * 60 * 1000;
+
+// ── 可重试错误：无限重试 + 指数退避 ────────────────────────────────────────────
+//
+// 2026-10-19 新增。目标：遇到「服务端内部错误」或「负载过高」时**一直重试**
+// 直到成功，而不是让守护进程把这一轮判成失败、把看板显示成「读不到数据」。
+//
+// 判定依据（HTTP 状态码）：
+//   429 负载过高 / 限流      → 重试
+//   500 内部错误             → 重试
+//   502 网关错误             → 重试
+//   503 服务不可用           → 重试
+//   504 网关超时             → 重试
+//
+// 明确**不**重试的：
+//   401 / 403  登录态失效 —— 重试无用，要重新取 token（走已有的 token 失效分支）
+//   其他 4xx   客户端错误 —— 重试没有意义
+//   业务错误   确定性失败（如参数非法、额度不足）
+//
+// 退避：min(base * 2^(n-1), cap) + 抖动，base=1s cap=60s。
+// 封顶 60s 是为了「无限重试」不会把接口打爆，也不会指数增长到没有尽头。
+pub const RETRY_BASE_MS: u64 = 1_000;
+pub const RETRY_CAP_MS: u64 = 60_000;
+
+/// 一次失败的**重试决策**。
+#[derive(Debug, PartialEq, Eq)]
+pub enum RetryDecision {
+    /// 值得重试（暂时性错误）：退避后重试，直到成功。
+    Retry,
+    /// 登录态失效：清 token 重取一次。
+    RefreshToken,
+    /// 确定性失败：直接报错，重试没有意义。
+    Fatal(String),
+}
+
+/// 根据一次请求的错误决定下一步。
+///
+/// 抽成纯函数是为了**能直接单测**（不依赖网络与真实 token）。
+/// 2026-10-19 新增无限重试时引入。
+pub fn decide_retry(err: &ureq::Error) -> RetryDecision {
+    match err {
+        // 401/403 ⇒ 登录态失效，重取 token（只重试一次，见调用点）
+        ureq::Error::StatusCode(401) | ureq::Error::StatusCode(403) => RetryDecision::RefreshToken,
+        // 429 负载过高 / 5xx 内部与网关错误 ⇒ 暂时性，值得一直重试
+        ureq::Error::StatusCode(code) if is_retryable_status(*code) => RetryDecision::Retry,
+        ureq::Error::StatusCode(code) => RetryDecision::Fatal(format!("HTTP {code}")),
+        // 网络层错误（连接重置 / 超时 / DNS 抖动）⇒ 也值得重试
+        ureq::Error::Io(_) | ureq::Error::Timeout(_) | ureq::Error::HostNotFound => {
+            RetryDecision::Retry
+        }
+        other => RetryDecision::Fatal(format!("{other}")),
+    }
+}
+
+/// 该 HTTP 状态码是否值得重试。
+pub fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504)
+}
+
+/// 退避时长：指数增长 + 抖动，封顶 `RETRY_CAP_MS`。
+///
+/// 抖动是必要的 —— 否则大量重试会形成「惊群」，同时打在同一时刻。
+pub fn retry_delay_ms(attempt: u32) -> u64 {
+    let exp = RETRY_BASE_MS
+        .saturating_mul(1u64 << attempt.saturating_sub(1).min(16))
+        .min(RETRY_CAP_MS);
+    exp + (pseudo_random() % 500)
+}
+
+/// 轻量伪随机（xorshift）——只为抖动，不需要密码学强度。
+fn pseudo_random() -> u64 {
+    use std::cell::Cell;
+    thread_local! {
+        static STATE: Cell<u64> = const { Cell::new(0x9E3779B97F4A7C15) };
+    }
+    STATE.with(|s| {
+        let mut x = s.get();
+        if x == 0 {
+            x = 0x9E3779B97F4A7C15;
+        }
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        s.set(x);
+        x
+    })
+}
 
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -205,8 +331,15 @@ impl Client {
         let base = self.base_for(code_domain);
         let url = format!("{base}{path}");
 
-        // 鉴权失败重取 token 再试一次
-        for attempt in 0..2 {
+        // 鉴权失败重取 token 再试一次；其余可重试错误**无限重试**。
+        //
+        // ⚠️ 无限重试的前提是「每次重试都真的会变好」：
+        //   - 401/403 ⇒ 重新取 token 后重试（最多一次，之后仍失败就报错）
+        //   - 429/5xx/网络错误 ⇒ 退避后重试，直到成功
+        // 退避封顶 60s，所以「无限」不会变成「疯狂打接口」。
+        let mut attempt = 0u32;
+        let mut retry_count = 0u32;
+        loop {
             let token = self.token();
             let auth = format!("Bearer {token}");
             let accept = "application/json";
@@ -240,19 +373,41 @@ impl Client {
                         serde_json::from_str(&text).map_err(json_err)?;
                     return check_business(value);
                 }
-                Err(ureq::Error::StatusCode(401)) | Err(ureq::Error::StatusCode(403))
-                    if attempt == 0 =>
-                {
-                    self.cached_at = 0;
-                    continue;
-                }
-                Err(ureq::Error::StatusCode(code)) => {
-                    return Err(ApiError::Network(format!("HTTP {code}")));
-                }
-                Err(e) => return Err(ApiError::Network(format!("{e}"))),
+                Err(e) => match decide_retry(&e) {
+                    // 登录态失效：清 token 重取一次（只一次）。
+                    RetryDecision::RefreshToken if attempt == 0 => {
+                        self.cached_at = 0;
+                        attempt += 1;
+                        continue;
+                    }
+                    RetryDecision::RefreshToken => {
+                        return Err(ApiError::Unauthorized("登录态失效".into()));
+                    }
+                    // ── 可重试的服务端错误 / 网络错误：无限重试 ──
+                    // 429 负载过高、5xx 内部与网关错误、连接重置 —— 都是**暂时性**的，
+                    // 重试有意义。退避封顶 60s，不会把接口打爆。
+                    RetryDecision::Retry => {
+                        if should_stop() {
+                            return Err(ApiError::Network("收到终止信号，放弃重试".into()));
+                        }
+                        retry_count += 1;
+                        let delay = retry_delay_ms(retry_count);
+                        crate::log(&format!(
+                            "⚠️  {method} {path} 失败（可重试，第 {retry_count} 次）：{e} ⇒ {secs}s 后重试",
+                            secs = delay / 1000,
+                        ));
+                        std::thread::sleep(Duration::from_millis(delay));
+                        continue;
+                    }
+                    // 确定性失败：重试没有意义，直接报错。
+                    RetryDecision::Fatal(msg) => {
+                        return Err(ApiError::Network(msg));
+                    }
+                },
             }
         }
-        Err(ApiError::Unauthorized("登录态失效".into()))
+        // 走到这里说明 loop 被 break —— 当前实现里所有分支都 return/continue，
+        // 所以这行不可达。保留它是为了让函数在将来引入 break 时仍能返回错误。
     }
 }
 
@@ -309,5 +464,89 @@ mod tests {
     fn unauthorized_code() {
         let v = serde_json::json!({"base_resp":{"status_code":1004,"status_msg":"not login"}});
         assert!(matches!(check_business(v), Err(ApiError::Unauthorized(_))));
+    }
+
+    /// 回归测试：可重试错误码的判定。
+    ///
+    /// 2026-10-19 新增「无限重试」功能：遇到 500（内部错误）与 429（负载过高）
+    /// 应当一直重试；401/403（登录态失效）与其他 4xx 属于确定性失败，
+    /// 重试没有意义，必须快速失败。
+    #[test]
+    fn retryable_status_set() {
+        for code in [429u16, 500, 502, 503, 504] {
+            assert!(is_retryable_status(code), "HTTP {code} 应当可重试");
+        }
+        for code in [400u16, 401, 403, 404, 422] {
+            assert!(!is_retryable_status(code), "HTTP {code} 不该重试");
+        }
+    }
+
+    /// 退避必须**封顶**，否则「无限重试」会指数增长到没有尽头。
+    #[test]
+    fn retry_delay_is_capped_and_grows() {
+        let d1 = retry_delay_ms(1);
+        let d5 = retry_delay_ms(5);
+        let d50 = retry_delay_ms(50);
+        let d1000 = retry_delay_ms(1000);
+        assert!(d5 > d1, "退避应随次数增长：d1={d1} d5={d5}");
+        assert!(
+            d50 <= RETRY_CAP_MS + 500,
+            "退避必须封顶在 cap+抖动内：d50={d50} cap={RETRY_CAP_MS}"
+        );
+        assert!(
+            d1000 <= RETRY_CAP_MS + 500,
+            "无限次重试也不能超过 cap+抖动：d1000={d1000}"
+        );
+    }
+
+    /// 回归测试：一次失败的**重试决策**。
+    ///
+    /// 2026-10-19 新增无限重试时引入的纯函数（可脱离网络单测）：
+    ///   - 429 / 5xx / 网络错误 ⇒ Retry（一直重试）
+    ///   - 401 / 403            ⇒ RefreshToken（重取 token，一次）
+    ///   - 其他 4xx              ⇒ Fatal（确定性失败，快速失败）
+    #[test]
+    fn retry_decision_matrix() {
+        // 可重试：负载过高与内部/网关错误
+        for code in [429u16, 500, 502, 503, 504] {
+            assert_eq!(
+                decide_retry(&ureq::Error::StatusCode(code)),
+                RetryDecision::Retry,
+                "HTTP {code} 应当一直重试"
+            );
+        }
+        // 登录态失效：重取 token
+        for code in [401u16, 403] {
+            assert_eq!(
+                decide_retry(&ureq::Error::StatusCode(code)),
+                RetryDecision::RefreshToken,
+                "HTTP {code} 应当重取 token"
+            );
+        }
+        // 确定性失败：快速失败
+        for code in [400u16, 404, 422] {
+            match decide_retry(&ureq::Error::StatusCode(code)) {
+                RetryDecision::Fatal(msg) => assert!(msg.contains(&code.to_string())),
+                other => panic!("HTTP {code} 应当快速失败，实际 {other:?}"),
+            }
+        }
+        // 网络层错误也重试
+        assert_eq!(
+            decide_retry(&ureq::Error::HostNotFound),
+            RetryDecision::Retry,
+            "DNS 解析失败应当重试"
+        );
+    }
+
+    /// 停止标志：置位后 should_stop 为真（无限重试靠它可中断）。
+    #[test]
+    fn stop_flag_roundtrip() {
+        assert!(!should_stop(), "初始状态应为未停止");
+        request_stop();
+        assert!(should_stop(), "置位后应为已停止");
+        request_stop(); // 幂等
+        assert!(should_stop());
+        // 复位，避免影响其它测试
+        STOPPED.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }

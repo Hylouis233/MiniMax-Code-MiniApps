@@ -172,14 +172,104 @@ class ApiError extends Error {
   }
 }
 
+/**
+ * 模块级日志出口。
+ *
+ * `context.logger` 只在 `start(context)` 里有，但重试辅助函数是模块级的
+ * （被 apiGet/apiPost 直接调用）。用这个引用把它们接进 Host 日志 ——
+ * 无限重试最怕变成「静默卡住」，日志必须能说明它在等什么。
+ */
+let hostLogger = null;
+
+/** 写一行到 Host 日志；未注入时退回 stderr。 */
+function log(message) {
+  if (hostLogger) {
+    hostLogger.warn(message);
+    return;
+  }
+  console.error(`[expiry-guardian] ${message}`);
+}
+
+// ── 可重试错误：无限重试 + 指数退避 ────────────────────────────────────────────
+//
+// 2026-10-19 新增。目标：遇到「服务端内部错误」或「负载过高」时**一直重试**
+// 直到成功，而不是让守护进程把这一轮判成失败、把看板显示成「读不到数据」。
+//
+// 判定依据（HTTP 状态码）：
+//   429 负载过高 / 限流      → 重试
+//   500 内部错误             → 重试
+//   502 网关错误             → 重试
+//   503 服务不可用           → 重试
+//   504 网关超时             → 重试
+//
+// 明确**不**重试的：
+//   401 / 403  登录态失效 —— 重试无用，要重新取 token（走已有的 token 失效分支）
+//   其他 4xx   客户端错误 —— 重试没有意义
+//   业务错误   确定性失败（如参数非法、额度不足）
+//
+// 退避：min(base * 2^(n-1), cap) + 抖动，base=1s cap=60s。
+// 封顶 60s 是为了「无限重试」不会把接口打爆，也不会指数增长到没有尽头。
+const RETRYABLE_HTTP = new Set([429, 500, 502, 503, 504]);
+const RETRY_BASE_MS = 1_000;
+const RETRY_CAP_MS = 60_000;
+
+/** 该 HTTP 状态码是否值得重试。 */
+function isRetryableStatus(status) {
+  return RETRYABLE_HTTP.has(status);
+}
+
+/**
+ * 退避时长：指数增长 + 抖动，封顶 RETRY_CAP_MS。
+ * 抖动是必要的 —— 否则大量并发重试会形成「惊群」，同时打在同一时刻。
+ */
+function retryDelayMs(attempt) {
+  const exp = Math.min(RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1), RETRY_CAP_MS);
+  return exp + Math.floor(Math.random() * 500);
+}
+
+/**
+ * 带无限重试的 fetch。
+ *
+ * 只对**可重试**的错误重试；其余错误原样抛出。
+ * 每次重试都如实打日志 —— 无限制重试最怕变成「静默卡住」，
+ * 看日志才知道它到底在等什么。
+ */
+async function fetchWithRetry(url, init, label) {
+  let attempt = 0;
+  for (;;) {
+    attempt += 1;
+    let response;
+    try {
+      response = await fetch(url, init);
+    } catch (err) {
+      // 网络层错误（连接重置 / DNS 抖动）⇒ 也值得重试
+      const delay = retryDelayMs(attempt);
+      log(`⚠️  ${label} 网络错误（第 ${attempt} 次）：${err?.message ?? err} ⇒ ${Math.round(delay / 1000)}s 后重试`);
+      await new Promise((r) => setTimeout(r, delay));
+      continue;
+    }
+    if (response.ok) return response;
+    if (!isRetryableStatus(response.status)) return response; // 交给调用方按原逻辑处理
+    const delay = retryDelayMs(attempt);
+    log(
+      `⚠️  ${label} 返回 HTTP ${response.status}（第 ${attempt} 次，可重试）⇒ ${Math.round(delay / 1000)}s 后重试`,
+    );
+    await new Promise((r) => setTimeout(r, delay));
+  }
+}
+
 async function apiGet(path, token, base = PLATFORM_BASE) {
-  const response = await fetch(`${base}${path}`, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: 'application/json',
-      'User-Agent': 'MiniMaxCode',
+  const response = await fetchWithRetry(
+    `${base}${path}`,
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/json',
+        'User-Agent': 'MiniMaxCode',
+      },
     },
-  });
+    `GET ${path}`,
+  );
   if (response.status === 401 || response.status === 403) {
     tokenCache = { value: null, at: 0 };
     throw new ApiError('登录态失效，请重新打开 MiniMax Code', 'unauthorized');
@@ -195,16 +285,20 @@ async function apiGet(path, token, base = PLATFORM_BASE) {
 
 /** 部分接口（如 get_membership_info）是 POST，桌面端即如此调用。 */
 async function apiPost(path, token, base = CODE_BASE, body = {}) {
-  const response = await fetch(`${base}${path}`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-      'User-Agent': 'MiniMaxCode',
+  const response = await fetchWithRetry(
+    `${base}${path}`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        'User-Agent': 'MiniMaxCode',
+      },
+      body: JSON.stringify(body),
     },
-    body: JSON.stringify(body),
-  });
+    `POST ${path}`,
+  );
   if (response.status === 401 || response.status === 403) {
     tokenCache = { value: null, at: 0 };
     throw new ApiError('登录态失效，请重新打开 MiniMax Code', 'unauthorized');
@@ -219,16 +313,25 @@ async function apiPost(path, token, base = CODE_BASE, body = {}) {
 }
 
 async function apiUseResetCard(sourceType, outBizNo, token) {
-  const response = await fetch(`${PLATFORM_BASE}/backend/account/reset_card/use`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-      'User-Agent': 'MiniMaxCode',
+  // 扣卡也走可重试路径。
+  //
+  // ⚠️ 重试扣卡安全吗？—— 安全：请求体带 `out_biz_no`，服务端以它为**幂等键**，
+  // 同一 out_biz_no 重复提交只会「回放」结果（outcome=REPLAYED），不会扣第二张卡。
+  // 这正是本项目一直依赖的去重机制。
+  const response = await fetchWithRetry(
+    `${PLATFORM_BASE}/backend/account/reset_card/use`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        'User-Agent': 'MiniMaxCode',
+      },
+      body: JSON.stringify({ source_type: sourceType, out_biz_no: outBizNo }),
     },
-    body: JSON.stringify({ source_type: sourceType, out_biz_no: outBizNo }),
-  });
+    'POST reset_card/use',
+  );
   if (!response.ok) throw new ApiError(`HTTP ${response.status}`, 'network', response.status);
   const payload = await response.json();
   const baseResp = payload?.base_resp;
@@ -633,7 +736,19 @@ const SOURCE_NAME = { platform: '平台积分', code: 'Code 积分', card: '重�
  *   卡先过期 → 用卡把额度重置回来，把更耐放的积分留着；
  *   积分先过期 → 不用卡，让积分自然消耗完，卡留到以后更划算的时候。
  */
-function decide({ platformPools, codeCredits, cards, quota }, nowMs = Date.now()) {
+/**
+ * @param creditDataComplete 积分数据是否**完整读到**。
+ *
+ * ⚠️ 2026-10-19 PR #28 review 修：读不到 ≠ 没有。
+ * 之前 `credit/details` 失败会返回 null ⇒ codeCredits 为空 ⇒
+ * `decide` 看到「没有积分」⇒ 结论从「留卡」翻转成「用卡」。
+ * 而扣卡是**真实写操作** —— 把网络故障当成业务状态会误扣真卡。
+ * ⇒ 数据不完整时一律**不做写操作**（动作降为 wait），只如实报出来。
+ */
+function decide(
+  { platformPools, codeCredits, cards, quota, creditDataComplete = true },
+  nowMs = Date.now(),
+) {
   const now = nowMs;
   const liveCards = cards.filter((c) => !c.expired && c.outBizNo && c.sourceType);
   const liveCredits = [...platformPools, ...codeCredits].filter(
@@ -686,6 +801,11 @@ function decide({ platformPools, codeCredits, cards, quota }, nowMs = Date.now()
     // 把触发线也说进来：否则「额度不足但暂不需要处理」看起来自相矛盾。
     // burned 永远不会出现在这里：它必然已 triggered，走的是下面用卡/留卡分支。
     reason = `${LEVEL_LABEL[level]}（5 小时已用 ${quota.fiveHour.usedPercent.toFixed(0)}%），未到 ${cfg.cardTriggerPercent}% 触发线，暂不动用重置卡`;
+  } else if (!creditDataComplete) {
+    // 积分数据没读全 ⇒ 无法判断「卡先过期还是积分先过期」
+    // ⇒ 绝不做写操作（扣卡是真实消耗，宁可等下一轮）。
+    action = 'wait';
+    reason = '积分数据读取不完整，本轮不执行写操作（等下一轮重新判定）';
   } else if (!earliestCredit) {
     // 没有可消耗的积分，只能靠卡把额度重置回来
     if (earliestCard) {
@@ -865,7 +985,29 @@ async function doBuildSnapshot() {
   const codeCredits = parseCodeCredits(codePage);
   // 触发线来自共享配置（默认 99%），不再写死在本文件里。
   const quota = quotaRaw ? parseQuota(quotaRaw, loadConfig().cardTriggerPercent) : null;
-  const decision = decide({ platformPools, codeCredits: codeCredits.items, cards, quota });
+
+  // ⚠️ 2026-10-19 PR #28 review 修：**读不到 ≠ 没有**。
+  // 之前 `credit/details` 失败被 `.catch(() => null)` 吞掉 ⇒ codePage 为 null
+  // ⇒ codeCredits 为空 ⇒ decide 认为「没有积分」⇒ 把结论从「留卡」翻转成
+  // 「用卡」。扣卡是真实写操作，网络故障不该导致误扣。
+  // ⇒ 这里显式区分「读取失败」与「读到但确实为空」：
+  //    平台积分池 / Code 积分明细 / 账户汇总 任一失败 ⇒ 数据不完整。
+  //
+  // 更精确的信号：`cached()` 失败时会**回落到旧值**并标 fromCache=true。
+  //   - 本轮读到新值（fromCache=false）⇒ 数据完整 ✅
+  //   - 本轮失败但有旧值（fromCache=true 且有值）⇒ 数据**过时但可用**
+  //     —— 仍然按「不完整」处理更安全：旧值可能已经过期，
+  //        而扣卡是真实写操作，宁可等下一轮。
+  //   - 本轮失败且无旧值（value=null）⇒ 完全没数据 ⇒ 同样不完整。
+  const creditDataComplete =
+    !platformRes.fromCache && !codeRes.fromCache && platformRaw != null && codePage != null;
+  const decision = decide({
+    platformPools,
+    codeCredits: codeCredits.items,
+    cards,
+    quota,
+    creditDataComplete,
+  });
 
   const now = Date.now();
   const soon7 = expiringWithin(codeCredits.items, 7, now);
@@ -935,6 +1077,21 @@ async function doBuildSnapshot() {
         .filter((c) => !c.expired)
         .slice(0, 12)
         .map((c, i) => ({ index: i + 1, expireTimeMs: c.expireTimeMs })),
+      // 原始可用卡列表（带 cardId）。
+      //
+      // ⚠️ 2026-10-19 PR #28 review 修：`items` 是给页面看的**脱敏视图**
+      // （只有序号与到期日，没有 cardId），拿它做「这张卡还在不在列表里」的
+      // 判断 ⇒ `c.cardId === target.cardId` 恒为 false ⇒ **每次都跳过，
+      // `reset_card/use` 永远不会被调用**。
+      // ⇒ 这里单独带一份原始列表，供写路径判定使用（页面不展示 cardId）。
+      raw: cards
+        .filter((c) => !c.expired)
+        .map((c) => ({
+          cardId: c.cardId,
+          sourceType: c.sourceType,
+          outBizNo: c.outBizNo,
+          expireTimeMs: c.expireTimeMs,
+        })),
     },
     cardUsage,
     decision,
@@ -992,8 +1149,10 @@ async function useCard(reasonLabel) {
    * 这比固定时间窗更准确：额度真正恢复前不会误扣，恢复了也不会漏扣。
    * 进程重启后 spent 清空也没关系，列表判定依然成立。
    */
-  const stillListed = (snapshot.cards.items ?? []).some(
-    (c) => c.cardId === target.cardId && !c.expired,
+  // ⚠️ 用 `cards.raw`（带 cardId）而不是 `cards.items`（脱敏视图，无 cardId）
+  // —— 2026-10-19 PR #28 review 修：用 items 时该判断恒为 false，扣卡永远被跳过。
+  const stillListed = (snapshot.cards.raw ?? []).some(
+    (c) => c.cardId === target.cardId,
   );
   if (!stillListed) {
     state.spent.set(fingerprint, { cardId: target.cardId, sourceType: target.sourceType, atMs: Date.now() });
@@ -1307,6 +1466,8 @@ function stopSsePolling() {
  * @returns {Promise<MiniAppLifecycle>}
  */
 export async function start(context) {
+  // 注入 Host 日志出口，供模块级的重试辅助函数使用（见 hostLogger 注释）。
+  hostLogger = context.logger ?? null;
   const clientHtml = await readFile(join(context.pluginRoot, 'miniapp/client/index.html'));
 
   const server = createServer((request, response) => {

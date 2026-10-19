@@ -20,8 +20,17 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+// 路径解析：优先用**插件包内**的副本（自包含），找不到再回落到本机开发目录。
+//
+// 2026-10-19 修：这个校验器原先硬编码 `~/Desktop/mmx/miniapps/...`，
+// 于是「把插件复制到别处」就完全跑不起来 —— 违反 CONTRIBUTING 里
+// 「插件应能独立复制使用，不依赖仓库里的其他目录」这条约定。
 const WORKSPACE = process.env.MCODE_WORKSPACE ?? join(homedir(), 'Desktop', 'mmx');
-const MINIAPP_SERVER = join(WORKSPACE, 'miniapps', 'expiry-guardian', 'miniapp', 'node', 'server.mjs');
+const PLUGIN_MINIAPP = join(HERE, '..', 'miniapp', 'node', 'server.mjs');
+const WORKSPACE_MINIAPP = join(
+  WORKSPACE, 'miniapps', 'expiry-guardian', 'miniapp', 'node', 'server.mjs',
+);
+const MINIAPP_SERVER = existsSync(PLUGIN_MINIAPP) ? PLUGIN_MINIAPP : WORKSPACE_MINIAPP;
 const BG_PY = join(HERE, 'reset_card_autouse.py');
 const RUST_DAEMON = join(HERE, 'rust', 'target', 'release', 'reset-card-daemon');
 const SNAPSHOT = join(HERE, 'bg_parity.json');
@@ -86,7 +95,9 @@ for c in payload["cases"]:
               "expire_time": NOW + d * DAY} for d in c["cards"]]
     exp = None if c["credit"] is None else NOW + c["credit"] * DAY
     cfg, _issues = m.load_config()
-    action, reason = m.decide_background(quotas, cards, exp, "平台积分", cfg, NOW)
+    action, reason = m.decide_background(
+        quotas, cards, exp, "平台积分", cfg, NOW, c.get("creditDataComplete", True)
+    )
     out.append({"n": c["n"], "action": action, "reason": reason})
 json.dump(out, sys.stdout, ensure_ascii=False)
 `;
@@ -133,6 +144,11 @@ const CASES = [
   { n: '5h 99% / 10分钟后刷新',   five: 99,  week: null,   cards: [7],  credit: 13, resetInMinutes: 10 },
   { n: '5h 99% / 恰好60分钟后刷新', five: 99, week: null,   cards: [7],  credit: 13, resetInMinutes: 60 },
   { n: '5h 99% / 61分钟后刷新',   five: 99,  week: null,   cards: [7],  credit: 13, resetInMinutes: 61 },
+  // 「读不到 ≠ 没有」：积分数据不完整时，三方都必须**不做写操作**。
+  // ⚠️ 2026-10-19 PR #28 review 修：以前读失败被当成「没有积分」，
+  // 结论会从「留卡」翻转成「用卡」——而扣卡是真实写操作。
+  { n: '积分数据不完整 / 耗尽 / 有卡', five: 100, week: null, cards: [7], credit: null, creditDataComplete: false },
+  { n: '积分数据不完整 / 耗尽 / 有卡有积分', five: 100, week: null, cards: [7], credit: 13, creditDataComplete: false },
 ];
 
 const miniResults = CASES.map((c) => {
@@ -147,6 +163,7 @@ const miniResults = CASES.map((c) => {
     codeCredits: [],
     cards: c.cards.map(mcard),
     quota: { fiveHour: five, weekly: week },
+    creditDataComplete: c.creditDataComplete !== false,
   }, NOW);
   return { n: c.n, action: d.action, reason: d.reason };
 });
@@ -156,7 +173,7 @@ const payload = JSON.stringify({
   trigger: TRIGGER, tight: 80, low: 95, skipBeforeResetMinutes: 60,
   cases: CASES.map((c) => ({
     n: c.n, five: c.five, week: c.week, cards: c.cards, credit: c.credit,
-    resetInMinutes: c.resetInMinutes,
+    resetInMinutes: c.resetInMinutes, creditDataComplete: c.creditDataComplete !== false,
   })),
 });
 
