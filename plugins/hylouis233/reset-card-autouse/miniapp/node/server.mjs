@@ -500,6 +500,12 @@ function defaultConfig() {
     cardTriggerPercent: DEFAULT_QUOTA_TRIGGER_PERCENT,
     cardSkipBeforeResetMinutes: DEFAULT_CARD_SKIP_BEFORE_RESET_MINUTES,
     resumeCronId: '',
+    botGuard: {
+      enabled: false,
+      idleMs: 90_000,
+      backoffBaseMs: 5_000,
+      backoffCapMs: 60_000,
+    },
     quotaLevels: { tight: DEFAULT_TIGHT_PERCENT, low: DEFAULT_LOW_PERCENT },
     goalPause: {
       enabled: false,
@@ -521,7 +527,7 @@ function clampNumber(value, lo, hi, fallback) {
  * 非法组合**整体回退默认并报出来**，绝不静默纠正 ——
  * 静默纠正会让人以为自己设的生效了。字段与 Rust config.rs 保持同名同义。
  */
-function normalizeConfig(raw) {
+export function normalizeConfig(raw) {
   const d = defaultConfig();
   const issues = [];
   const src = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
@@ -562,6 +568,10 @@ function normalizeConfig(raw) {
     // 同时也不会再武装 —— 整个恢复机制静默失效，而且看不出任何报错。
     // 它不是用户可改项，只是守护进程要知道该武装哪个 cron。
     resumeCronId: typeof src.resumeCronId === 'string' ? src.resumeCronId : d.resumeCronId,
+    // ⚠️ 同样必须原样保留 `botGuard`（2026-10-19 补）：Bot 守护的配置
+    // （开关、闲置判定、退避上下限）。漏掉它 ⇒ 用户在页面改任何设置都会把
+    // 守护开关抹掉 ⇒ 守护静默失效。
+    botGuard: normalizeBotGuard(src.botGuard),
     quotaLevels: { tight, low },
     goalPause: {
       enabled: gp.enabled === true,
@@ -573,6 +583,23 @@ function normalizeConfig(raw) {
 }
 
 /** 读配置。文件不存在是正常情况（首次运行），返回默认值且不记 issue。 */
+/** Bot 守护配置的归一化：非法值夹到合法区间，缺失用默认。 */
+function normalizeBotGuard(raw) {
+  const d = defaultConfig().botGuard;
+  const src = raw && typeof raw === 'object' ? raw : {};
+  const num = (v, lo, hi, fallback) => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.min(hi, Math.max(lo, n));
+  };
+  return {
+    enabled: src.enabled === true,
+    idleMs: num(src.idleMs, 10_000, 3_600_000, d.idleMs),
+    backoffBaseMs: num(src.backoffBaseMs, 1_000, 600_000, d.backoffBaseMs),
+    backoffCapMs: num(src.backoffCapMs, 1_000, 3_600_000, d.backoffCapMs),
+  };
+}
+
 function readConfig() {
   let text;
   try {

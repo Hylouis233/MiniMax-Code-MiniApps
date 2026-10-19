@@ -63,6 +63,41 @@ correction would make you believe a setting took effect when it did not.
 The daemon re-reads the file every cycle, so changes take effect within about a minute
 without a restart. The Mini App's “Automation thresholds” card edits the same file.
 
+## Bot watchdog: a crashed Bot comes back on its own
+
+MiniMax Bot creates a **new session** every time it fails, so a Bot that keeps
+crashing leaves a trail of dead sessions and a new error notice each time.
+
+This package watches your Bot team and re-enables the ones that died from a
+**temporary** failure — reusing the Bot's original session instead of creating
+another one.
+
+| Situation | What the watchdog does |
+| --- | --- |
+| HTTP 500, network change, 429/529, TPM rate limit, 400/404/422 | Waits out a backoff, then **re-enables the same session** |
+| Token Plan limit reached (42212), credits exhausted (50110), login expired (50112) | **Does not retry.** Tells you exactly what to fix |
+| The Bot is fine, or only has a stale error code from an earlier turn | Leaves it alone |
+
+The full diagnosis, with the evidence behind it, is in
+[`docs/BOT_DIAGNOSIS.md`](docs/BOT_DIAGNOSIS.md).
+
+### How it re-enables a Bot
+
+The watchdog runs outside the Host (a `launchd` service, no token, unattended),
+so it cannot reach MiniMax Bot's MCP endpoint — the Host assigns that port and
+its MCP client sends a per-run credential other processes do not have. Three
+channels were measured on 2026-10-19:
+
+| Channel | Can it continue another Mini App's session? | Verdict |
+| --- | --- | --- |
+| `context.agent.run({ sessionId })` | No | The contract says *each Mini App owns its sessions and can continue only those* |
+| Calling the other Mini App's MCP endpoint directly | No | The Host's MCP client sends a per-run credential that other processes do not have |
+| **Running an Agent that calls the `message_bot` MCP tool** | **Yes** | Measured: a Bot stuck on 42212 woke up and answered within 13 seconds |
+
+So the watchdog decides *who* needs waking and writes the request; a small cron
+watcher in the main agent directory performs the delivery through `message_bot`.
+The target Bot keeps its own session, memory and conversation history.
+
 ## Retry policy: retryable failures are retried forever
 
 When the account API answers with a **temporary** failure, the request is retried

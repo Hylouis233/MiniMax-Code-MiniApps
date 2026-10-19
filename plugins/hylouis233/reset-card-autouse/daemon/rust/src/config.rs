@@ -52,6 +52,45 @@ impl Default for QuotaLevels {
 ///
 /// `deny_unknown_fields` 是配套的安全网：宁可解析失败并报出来，
 /// 也不要「静默降级成默认值」让人以为自己设的值生效了。
+/// Bot 守护配置（守护 MiniMax Bot 团队）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BotGuardCfg {
+    /// 总开关。默认关 —— 需要用户明确开启。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 超过多久没有任何活动才算「闲下来」（毫秒）。
+    #[serde(default = "d_bot_idle")]
+    pub idle_ms: i64,
+    /// 退避基数（毫秒）。
+    #[serde(default = "d_bot_backoff_base")]
+    pub backoff_base_ms: i64,
+    /// 退避上限（毫秒）。
+    #[serde(default = "d_bot_backoff_cap")]
+    pub backoff_cap_ms: i64,
+}
+
+fn d_bot_idle() -> i64 {
+    90_000
+}
+fn d_bot_backoff_base() -> i64 {
+    5_000
+}
+fn d_bot_backoff_cap() -> i64 {
+    60_000
+}
+
+impl Default for BotGuardCfg {
+    fn default() -> Self {
+        BotGuardCfg {
+            enabled: false,
+            idle_ms: d_bot_idle(),
+            backoff_base_ms: d_bot_backoff_base(),
+            backoff_cap_ms: d_bot_backoff_cap(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GoalPauseCfg {
@@ -87,6 +126,9 @@ pub struct Config {
     pub quota_levels: QuotaLevels,
     #[serde(default)]
     pub goal_pause: GoalPauseCfg,
+    /// 守护 MiniMax Bot 团队：挂掉了自动重新启用。
+    #[serde(default)]
+    pub bot_guard: BotGuardCfg,
 }
 
 fn one() -> u32 {
@@ -110,6 +152,7 @@ impl Default for Config {
             resume_cron_id: String::new(),
             quota_levels: QuotaLevels::default(),
             goal_pause: GoalPauseCfg::default(),
+            bot_guard: BotGuardCfg::default(),
         }
     }
 }

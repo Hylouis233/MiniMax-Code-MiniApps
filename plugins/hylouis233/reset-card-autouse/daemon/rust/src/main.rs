@@ -11,6 +11,7 @@
 mod api;
 mod config;
 mod decision;
+mod bot_guard;
 mod goal_sync;
 mod goal_wake;
 mod state;
@@ -349,6 +350,14 @@ impl Daemon {
         };
         let usable = self.usable_cards();
         let (credit_expiry, credit_desc, credit_data_complete) = self.earliest_credit();
+
+        // ── 第 0 步：守护 MiniMax Bot 团队（失败绝不拖垮任何东西）──
+        // 与 Goal 暂停/恢复互不依赖：bot 挂掉和额度是两回事。
+        if cfg.bot_guard.enabled {
+            if let Err(e) = bot_guard::tick(&cfg.bot_guard) {
+                log(&format!("⚠️  Bot 守护本轮出错（不影响其它功能）: {e}"));
+            }
+        }
 
         // ── 第 1 步：同步 Goal（失败不拖垮扣卡）──
         // 顺序固定为「先让目标停下，再决定要不要补额度」，反过来两者会打架。

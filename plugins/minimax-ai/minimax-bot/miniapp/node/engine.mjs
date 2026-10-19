@@ -51,8 +51,13 @@ const NO_RETRY_REASONS = new Set(['auth', 'quota', 'context_too_long', 'blocked'
  *   / unknown error, 520 / open platform service unavailable / 502 Bad Gateway
  * ⇒ 在这里按消息文本把它们与「确定性失败」分开。
  *
- * ⚠️ 仍**不重试**的：400/404/422 这类「服务端已明确拒绝」的错误
- *   （重试十次还是同样结果），以及额度/鉴权类（见 NO_RETRY_REASONS）。
+ * ⚠️ 2026-10-19 用户决定：**400 / 404 也重试**。
+ *   之前这里不重试（理由是「服务端已明确拒绝，重试十次还是同样结果」），
+ *   但实际后果是 bot 挂掉后要靠人手点一下才回来 —— 而这类失败在
+ *   MiniMax 的链路上是**可能自愈**的（网关重试、实例漂移、临时路由错误）。
+ *   宁可多等一会儿，也不要让 bot 停在那里。
+ *   ⇒ 但重试要**看得见**：连续失败很多次后要明确告诉用户「一直在重试」，
+ *     否则界面只显示「模型有点忙，再试一次」，人会以为它在正常工作。
  */
 const TRANSIENT_ERROR_PATTERNS = [
   /net::ERR_NETWORK_CHANGED/i,
@@ -66,6 +71,16 @@ const TRANSIENT_ERROR_PATTERNS = [
   /请求处理超时/,
   /unknown error, *520/,
   /overloaded|rate limit|too many requests|model is busy/i,
+  // 400 / 404 / 422 也重试（2026-10-19 用户决定）。这类错误在 MiniMax 的
+  // 链路上可能自愈（网关重试、实例漂移、临时路由错误），宁可多等也不要让
+  // bot 停在那里等人来点。
+  //
+  // ⚠️ 只匹配**明确的 HTTP 错误形态**，不能光匹配数字 ——
+  // 否则「用了 400 tokens」「第 404 步」这类正常消息会被误判成错误。
+  // 要求形如 `HTTP 400` / `status 404` / `code=422` / `400 Bad Request`。
+  /\b(?:http|status(?:\s+code)?|code)\s*[:=]?\s*(400|404|422)\b/i,
+  /\b(400|404|422)\s+(bad request|not found|unprocessable\w*)/i,
+  /\bbad request\b|\bnot found\b|\bunprocessable\w*\b/i,
 ];
 
 /**
