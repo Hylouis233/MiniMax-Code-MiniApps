@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "mcpServers": {
+    "minimax-bot": {
+      "type": "streamable-http",
+      "url": "http://127.0.0.1:9/mcp/minimax-bot",
+      "headers": {},
+      "description": "MiniMax Bot team tools. The watchdog uses message_bot to wake a Bot that crashed, reusing its existing session.",
+      "timeout": 900000
+    }
+  }
+}
