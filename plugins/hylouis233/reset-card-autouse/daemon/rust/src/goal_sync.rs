@@ -896,21 +896,31 @@ fn reconcile_resume_cron(db: &PathBuf, cfg: &crate::config::Config) {
     if cron_id.is_empty() {
         return;
     }
-    let pending = crate::goal_wake::pending_request_ids();
+    // ⚠️ pending 必须**合并两类请求**（2026-10-19 实测修）：
+    // 只看 Goal 的 pending ⇒ Bot 守护写的请求永远不被投递，cron 也不会被武装。
+    // 两者共用同一个 cron 值守（它的 prompt 同时处理两类请求），所以只要
+    // 任意一类有待处理，就要武装。
+    let goal_pending = crate::goal_wake::pending_request_ids();
+    let bot_pending = crate::bot_guard::pending_request_ids();
+    let pending_len = goal_pending.len() + bot_pending.len();
     let armed = crate::goal_wake::cron_is_armed(db, cron_id);
     // 诊断：这一轮武装状态与 pending 数量都要能看到，否则「cron 怎么还 armed」
     // 只能靠猜（2026-10-19 实测：这个分支原来完全不打日志，排查时毫无线索）。
     log(&format!(
-        "cron 值守状态: pending 请求 {} 个，cron {}",
-        pending.len(),
+        "cron 值守状态: pending 请求 {} 个（Goal {} + Bot {}），cron {}",
+        pending_len,
+        goal_pending.len(),
+        bot_pending.len(),
         if armed { "已武装" } else { "未武装" }
     ));
-    if !pending.is_empty() {
+    if pending_len > 0 {
         if !armed {
             match crate::goal_wake::set_cron_armed(db, cron_id, true) {
                 Ok(_) => log(&format!(
-                    "已武装「目标恢复值守」cron（{} 个目标待恢复）",
-                    pending.len()
+                    "已武装「目标恢复值守」cron（{} 个待处理：Goal {} + Bot {}）",
+                    pending_len,
+                    goal_pending.len(),
+                    bot_pending.len()
                 )),
                 Err(e) => log(&format!("⚠️  武装恢复 cron 失败: {e}")),
             }
