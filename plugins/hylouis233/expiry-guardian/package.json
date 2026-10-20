@@ -1,0 +1,10 @@
+{
+  "name": "expiry-guardian",
+  "version": "1.6.0",
+  "private": true,
+  "type": "module",
+  "mcode": {
+    "schemaVersion": 2,
+    "miniApp": "./miniapp/miniapp.json"
+  }
+}

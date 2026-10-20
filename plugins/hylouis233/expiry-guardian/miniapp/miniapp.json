@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "artifacts": {
+    "client": [
+      "./miniapp/client"
+    ],
+    "node": [
+      "./miniapp/node"
+    ]
+  },
+  "runtime": {
+    "kind": "process",
+    "entry": "./miniapp/node/server.mjs",
+    "lifecycle": "on-demand"
+  },
+  "surface": {
+    "path": "/dashboard"
+  },
+  "agentAccess": [
+    "session.run"
+  ],
+  "agentConcurrency": 2,
+  "mcpEndpoints": [
+    {
+      "server": "expiry-guardian",
+      "path": "/mcp/expiry-guardian"
+    }
+  ]
+}
