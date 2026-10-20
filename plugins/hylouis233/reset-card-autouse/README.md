@@ -17,6 +17,31 @@ when that is the right move, and resumes the goals once the quota comes back.
 | **Card selection** | "Expiring first" policy: if the card expires before the credits, spend the card; if the credits expire first, let the credits burn first and keep the card. |
 | **Headless** | The daemon keeps running with MiniMax Code closed, after logout, and while the machine sleeps. |
 
+### v1.5 — architecture hardening (2026-10-20, evening)
+
+The architecture is unchanged: the Rust daemon **decides and records**, this
+Mini App **delivers** (`session send`). This release is all about hardening the
+parts that looked fine but failed silently.
+
+| Change | Effect |
+| --- | --- |
+| **Wake-session reuse** — the first wake host session id is stored in `bot-wake-host-session.json` and reused | Wake-ups no longer cold-start (≈93k tokens each). Measured on 2026-10-20 02:39: waking 6 Bots created **0** new sessions (it used to create one per Bot) |
+| **Request lifetime** — "30-minute TTL" replaced by "at most **3 attempts** (`MAX_ATTEMPTS`) + a **24-hour** backstop (`MAX_REQUEST_AGE_MS`)" | With the panel closed nobody consumed the requests, so after 30 minutes they were all gone — and when the panel reopened the Bots were broken again with **no request left to send** (measured: 7 requests, none consumed, 70 s after closing) |
+| **`acked` is no longer a permanent blacklist** — entries carry a timestamp and are suppressed for **30 minutes** only (`ACK_SUPPRESS_WINDOW_MS`) | 6 Bots had broken again (idle 47–94 minutes, far past the 90 s threshold) yet were **never woken again** because their ids sat in `acked`. The old format (plain string array) still reads and is treated as "a long time ago" — no suppression |
+| **Three concurrent-write bugs fixed** (temp filename clash / lost update / cleanup condition) | The cleanup-condition bug made the **3-attempt cap an illusion — unlimited retries**, each burning a wake-up turn |
+| **Transient errors are not resent** | `BUSY` / `session_busy` (a turn is already in flight) is retried later, **not resent**; `AGENT_OUTCOME_UNKNOWN` (the turn may already have run) is acked outright ⇒ otherwise the Bot receives **two** duplicate "continue from where you stopped" messages |
+| **Client 401 self-healing** | The panel no longer sticks on "live connection lost": 3 consecutive 401s ⇒ `window.location.reload()`, capped at **5** reloads (counted in sessionStorage), reset on any success |
+| **New local MCP endpoint** | `watchdog_status` / `watchdog_wake` / `watchdog_decide` — other plugins can ask this one directly. Deliberately **no "spend a card"**: spending is a real write (one card fewer) |
+| **`50111` is now self-healing** | Short-window rate limiting (HTTP 429) used to fall into "unknown error code ⇒ do not retry", even though 429 is on the Host's retry allowlist |
+| **New `check-test-parity.sh`** | The workspace source and the plugin package each keep their own copy of the tests, with different layouts ⇒ changing one and forgetting the other made the package run stale tests |
+
+Tests: Rust **51/51**, Python **20/20**, MiniApp **112/112**
+(bot_wakeup 35 + config-fidelity 15 + decision 58 + retry.behavior 4).
+
+The full write-up of each item is in
+[`docs/README.zh-CN.md`](docs/README.zh-CN.md); the wake-up channel is broken
+down in [`docs/BOT_DIAGNOSIS.md`](docs/BOT_DIAGNOSIS.md).
+
 ## Install
 
 1. Install this plugin in MiniMax Code.
@@ -85,8 +110,8 @@ The full diagnosis, with the evidence behind it, is in
 
 The watchdog runs outside the Host (a `launchd` service, no token, unattended),
 so it cannot reach MiniMax Bot's MCP endpoint — the Host assigns that port and
-its MCP client sends a per-run credential other processes do not have. Three
-channels were measured on 2026-10-19:
+its MCP client sends a per-run credential other processes do not have. Four
+channels were measured on 2026-10-19 / 2026-10-20:
 
 | Channel | Can it continue another Mini App's session? | Verdict |
 | --- | --- | --- |
@@ -100,8 +125,49 @@ performs the delivery from inside the Host by starting an agent turn whose agent
 calls `session send`. The target Bot keeps its own session, memory and
 conversation history.
 
-**Cost.** Each wake costs one agent turn (about 93k tokens end to end). The loop
-therefore runs **only when there is something pending** — it never spins.
+**Cost.** Each wake costs one agent turn. A *cold* wake — one that creates a
+fresh session — measures ≈93k tokens end to end (input 42k / output 374 /
+cache read 51k). Since v1.5 the wake-up turn **reuses one host session**
+(`bot-wake-host-session.json`), so the system prompt and tool definitions stay
+in the context cache and each wake costs only the increment. The loop therefore
+runs **only when there is something pending** — it never spins.
+
+**Request lifetime.** A request stays alive until it has been **attempted 3
+times** (`MAX_ATTEMPTS`); the 24-hour limit (`MAX_REQUEST_AGE_MS`) is only a
+backstop against zombie entries. The attempt counter lives in its own file
+(`bot-revive-attempts.json`) because the daemon and this Mini App write
+concurrently — a read-modify-write on the shared request file is a lost update.
+A successfully woken id is recorded in `bot-revive-acked.json` **with a
+timestamp** and is only suppressed for 30 minutes, so a Bot that breaks again
+later can be woken again.
+
+## Local MCP endpoint
+
+This Mini App exposes a **local MCP endpoint** so other plugins can ask it
+directly from their own turns.
+
+| | |
+| --- | --- |
+| Implementation | `miniapp/node/mcp.mjs` |
+| Declaration | `mcpEndpoints` in `miniapp/miniapp.json` + `servers.mcp.json` at the package root |
+| Path | `/mcp/expiry-guardian` (and, for compatibility, `/mcp/minimax-bot`) |
+| Transport | streamable-http |
+
+| Tool | What it does |
+| --- | --- |
+| `watchdog_status` | Current quota, reset-card / credit expiry, and the **pending wake-up queue** (including how many times each request has been attempted) |
+| `watchdog_wake` | Run **one wake-up round right now** (does not wait for the 60 s poll) |
+| `watchdog_decide` | Decide right now: should a card be spent, which one, and why (**decides only — never spends**) |
+
+⚠️ **"Spend a card" is deliberately not exposed**: spending is a real write
+(one card fewer), and letting any plugin spend on a whim is too dangerous ⇒
+use the panel button.
+
+⚠️ **A declared endpoint must really exist**: the Host probes it at publish time
+with `initialize` + `tools/list` and fails the publish if the probe does not
+answer. The Host's in-memory "published snapshot" is also **sticky** — once a
+manifest version declares `mcpEndpoints`, later versions must keep declaring the
+same endpoints or `miniapp publish` is rejected with `MCP_PUBLICATION_INVALID`.
 
 ## Retry policy: retryable failures are retried forever
 
@@ -175,7 +241,9 @@ only the delivery path.
 | `~/.config/mcode-reset-card/goal-resume-requests.json` | Pending wake-up requests. |
 | `~/.config/mcode-reset-card/goal-resume-acked.json` | Which goal requests have been handled (idempotency). |
 | `~/.config/mcode-reset-card/bot-revive-requests.json` | Pending Bot wake-up requests. |
-| `~/.config/mcode-reset-card/bot-revive-acked.json` | Which Bot requests have been handled (idempotency). |
+| `~/.config/mcode-reset-card/bot-revive-acked.json` | Which Bot requests have been handled, **with a timestamp** — suppressed for 30 minutes only. |
+| `~/.config/mcode-reset-card/bot-revive-attempts.json` | How many times each request has been attempted (**3 ⇒ void**). Separate file so the daemon and the Mini App never lose each other's writes. |
+| `~/.config/mcode-reset-card/bot-wake-host-session.json` | The reused wake-up host session id (saves the cold start). |
 | `~/.config/mcode-reset-card/bot-notified.json` | Which Bot errors have already been reported, so the same one is not repeated every minute. |
 | `/tmp/mcode-reset-card.log` | Daemon log. |
 
@@ -215,13 +283,25 @@ only the delivery path.
   in the manifest but forces it back to `"on-demand"` when it reads it, so the
   delivery loop only runs while the panel is open. The daemon keeps deciding and
   recording while the panel is closed; the wake-ups are delivered when it opens again.
-- Each wake costs one agent turn (about 93k tokens end to end), and a Bot that
-  fails with a rate-limit error (50150) may need another attempt on a later round.
+- Each wake costs one agent turn (≈93k tokens when cold; an increment once the
+  host session is reused), and a Bot that fails with a rate-limit error (50150)
+  may need another attempt on a later round.
+- **The official `minimax-bot` plugin cannot be forked locally** — `miniapp publish`
+  returns `OFFICIAL_PLUGIN_READ_ONLY`. The wake-up side therefore has to be this
+  Mini App (it holds `agentAccess: ["session.run"]`).
+- ⚠️ **Known Host-side issue**: once a manifest version declares `mcpEndpoints`,
+  later versions must keep declaring the same endpoints, otherwise
+  `miniapp publish` is rejected with `MCP_PUBLICATION_INVALID` (the Host's
+  "published snapshot" in memory is sticky). The current workspace deploys by
+  syncing straight into `~/.minimax/plugins/expiry-guardian/` and running
+  `miniapp open`.
 
 ## Documentation
 
-Full architecture notes, the eleven pitfalls this package works around, and the
+Full architecture notes, the twenty pitfalls this package works around, and the
 verification recipes are in [`docs/README.zh-CN.md`](docs/README.zh-CN.md).
+The wake-up channel — every measured dead end included — is in
+[`docs/BOT_DIAGNOSIS.md`](docs/BOT_DIAGNOSIS.md).
 
 ## License
 

@@ -3,6 +3,19 @@
 
 > English version: [../README.md](../README.md)
 
+> **v1.5** — 2026-10-20 晚间。**架构加固**：唤醒会话复用、请求判据换轨、
+> acked 不再是永久黑名单、修掉并发写的三个坑、客户端 401 自愈、新增 local MCP 端点。
+>
+> - **架构不变**：Rust 守护进程只做**判定 + 记账**；蹬王之王自己的 MiniApp 负责**投递**
+> - 唤醒会话复用 ⇒ 唤醒不再每次冷启动（实测 02:39 一轮唤醒 6 个 bot，**新建会话数 0**）
+> - 请求判据：从「30 分钟 TTL」改成「**最多试 3 次 + 24 小时兜底**」
+> - acked 改成带时间戳 ⇒ 只抑制 30 分钟，**不再「救过一次就永久不救」**
+> - 修掉并发写的三个坑：临时文件名撞车 / lost update / 清理条件把 3 次封顶架空
+> - 瞬时错误**不重发**（`BUSY` / `AGENT_OUTCOME_UNKNOWN`）⇒ bot 不再收到重复的续跑消息
+> - 客户端 401 自愈：连续 3 次 401 ⇒ 整页重载（上限 5 次），面板不再卡在「实时连接中断」
+> - 新增 local MCP 端点（`watchdog_status` / `watchdog_wake` / `watchdog_decide`）
+> - 补 `50111`（短时限流）到可自愈分类；新增 `check-test-parity.sh`
+>
 > **v1.4** — 2026-10-20。**彻底删掉定时任务（cron）依赖**，唤醒通道换成
 > 「自己的 MiniApp 起一个回合 + 会话内 `session send`」。
 >
@@ -26,6 +39,26 @@
 >
 > **v1.1** 修掉 3 个让恢复机制**长期假成功**的缺陷，补上 2 道闸门，
 > 并把踩过的 11 个坑全部落进文档与回归测试。详见 [v1.1 更新内容](#v11-更新内容)。
+
+### v1.5 更新内容
+
+**架构本身没变**（Rust 判定 + 记账，MiniApp 投递），这一版全是**加固**：
+把几个「看起来能跑、实际会静默失效」的地方修掉。
+
+| # | 变更 | 后果 |
+| --- | --- | --- |
+| 1 | **唤醒会话复用**：首次创建的唤醒会话 id 存进 `bot-wake-host-session.json`，后续 `agent.run({text, sessionId})` 复用它 | 每次唤醒不再冷启动（实测冷启动 ≈ 93k tokens）⇒ **2026-10-20 02:39 一轮唤醒 6 个 bot，新建会话数 = 0**（此前每个 bot 新建一个） |
+| 2 | **请求判据换轨**：从「30 分钟 TTL」改成「**最多试 3 次**（`MAX_ATTEMPTS`）+ **24 小时兜底**（`MAX_REQUEST_AGE_MS`）」 | 面板关着时没人消费 ⇒ 30 分钟后请求全过期 ⇒ 面板再打开时 bot 又挂了却**没有请求可发**（实测：面板关 70 秒后 7 条请求全未被消费） |
+| 3 | **acked 不再是永久黑名单**：`bot-revive-acked.json` 改成带时间戳，只抑制 **30 分钟**（`ACK_SUPPRESS_WINDOW_MS`） | 6 个 bot 明明又坏了（闲置 47~94 分钟，远超 90 秒阈值），却因 acked 里有过它们而**永远不再被叫醒**。旧格式（纯字符串数组）仍能读，视为「很久以前」不抑制 |
+| 4 | **修掉并发写的三个坑**（临时文件名撞车 / lost update / 清理条件） | 详见「踩过的坑」#15 —— 其中「清理条件」那条会让 **3 次封顶被架空，变成无限重试** |
+| 5 | **瞬时错误不重发** | `BUSY` / `session_busy`（该会话已有回合在飞）**可重试，但不是重发**；`AGENT_OUTCOME_UNKNOWN`（回合可能已经跑了）直接 ack ⇒ 否则 bot 会收到**两条**重复的「请从中断处继续」 |
+| 6 | **客户端 401 自愈** | 面板「实时连接中断」不再是死循环：连续 **3** 次 401 ⇒ `window.location.reload()`，重载次数用 sessionStorage 记、**上限 5 次**，成功一次就清零 |
+| 7 | **新增 local MCP 端点** | `miniapp/node/mcp.mjs` + `servers.mcp.json` + manifest 的 `mcpEndpoints`。三个工具：`watchdog_status` / `watchdog_wake` / `watchdog_decide`。⚠️ **刻意不暴露「扣卡」** |
+| 8 | **`50111` 纳入可自愈** | 短时限流（HTTP 429）此前落进「未知错误码 ⇒ 不自动重试」，而 429 本身在 Host 的可重试白名单里 |
+| 9 | **新增 `check-test-parity.sh`** | 工作区源码与插件包**各有一份测试**、路径布局还不同 ⇒ 改一边忘另一边，插件包跑的就是旧测试 |
+
+测试：Rust **51/51**、Python **20/20**、MiniApp **112/112**
+（bot_wakeup 35 + config-fidelity 15 + decision 58 + retry.behavior 4）。
 
 ### v1.2 更新内容
 
@@ -54,7 +87,9 @@
 - [完整闭环](#完整闭环一条消息怎么走完全程)
 - [为什么彻底去掉定时任务](#为什么彻底去掉定时任务cron)
 - [Bot 看门狗](#bot-看门狗挂掉的-bot-自己回来)
-- [踩过的坑](#踩过的坑十四个都写在这里了)
+- [local MCP 端点](#local-mcp-端点)
+- [客户端 401 自愈](#客户端-401-自愈)
+- [踩过的坑](#踩过的坑二十个都写在这里了)
 - [扣卡规则](#扣卡规则与-mini-app蹬王之王逐条一致)
 - [管理命令](#管理命令)
 - [测试](#一致性是测出来的不是声称的)
@@ -73,10 +108,14 @@
 
 两者都用服务端的 `out_biz_no` 幂等键，**不会重复扣同一张卡**。
 
-> ⚠️ **关掉面板会怎样（v1.4 起变了）**
+> ⚠️ **关掉面板会怎样（v1.4 起变了，v1.5 又改了请求时效）**
 > 守护进程照常判定、照常记账、照常写请求文件 —— 扣卡与暂停**不受影响**。
 > 但**唤醒不会发生**：投递方是 MiniApp 进程，面板关着它就不在。
-> 面板再打开时，积压的请求会被补上（请求有 30 分钟时效上限，过期作废）。
+> 面板再打开时，积压的请求会被补上。
+>
+> v1.4 时请求有 **30 分钟**时效上限 ⇒ 面板关久了请求全过期 ⇒ 打开时反而**没有请求可发**。
+> v1.5 改成「**最多试 3 次 + 24 小时兜底**」⇒ 面板关多久都不影响（请求一直在那儿等着），
+> 代价是叫不醒的 bot 最多试 3 轮。见 [唤醒请求的生命周期](#唤醒请求的生命周期代码常量不是配置项)。
 
 **代码位置**
 
@@ -85,8 +124,10 @@
 | Rust 守护进程（主力） | `daemon/rust/src/` |
 | Python 决策参考实现 | `daemon/reset_card_autouse.py` |
 | 三方一致性校验器 | `daemon/verify-parity.mjs` + `daemon/check-parity.sh` |
-| Mini App（看板 + 唤醒投递方） | `miniapp/`（**本包内**，自包含，不依赖仓库里的其他目录） |
+| Mini App（看板 + 唤醒投递方 + MCP 端点） | `miniapp/`（**本包内**，自包含，不依赖仓库里的其他目录） |
 | Bot 唤醒逻辑 | `miniapp/node/bot_wakeup.mjs` |
+| local MCP 端点 | `miniapp/node/mcp.mjs` + 根目录 `servers.mcp.json` |
+| 测试一致性校验 | 根目录 `check-test-parity.sh`（工作区 ↔ 插件包） |
 
 ---
 
@@ -190,7 +231,7 @@ MiniMax Bot 每失败一次就**新建一个会话**，所以一个反复挂掉�
 
 | 情况 | 看门狗怎么做 |
 | --- | --- |
-| HTTP 500、网络切换、集群过载、TPM 限流 | 退避等待后**复用原会话**重新启用 |
+| HTTP 500、网络切换、集群过载、TPM 限流、短时限流(50111) | 退避等待后**复用原会话**重新启用 |
 | Token Plan 到顶(42212)、积分耗尽(50110)、登录失效(50112) | **不重试**，明确告诉你缺什么 |
 | bot 本身正常、或只是残留着上一轮的过期错误码 | 不打扰它 |
 
@@ -207,12 +248,13 @@ MiniMax Bot 每失败一次就**新建一个会话**，所以一个反复挂掉�
 | **50112** | `LLM_AUTH_ERROR` — 登录态失效 | 🔴 需人工 | 不重试，提示重新登录 |
 | 文本含 `Cron definition was deleted` | 那个定时任务被删了 | 🔴 需人工 | 不重试，提示「需要重新安排」 |
 | **50113** | `LLM_UPSTREAM_ERROR` — 通用 4xx/5xx 兜底（HTTP 500 落这里） | ✅ 可自愈 | 退避后自动唤醒 |
+| **50111** | `LLM_RATE_LIMITED` — 短时限流（HTTP 429） | ✅ 可自愈（**v1.5 补上**） | 退避后自动唤醒。此前它落进「未知错误码 ⇒ 不自动重试」，而 429 本身在 Host 的可重试白名单里 |
 | **50150** | `LLM_TPM_RATE_LIMITED` — TPM/RPM 限流 | ✅ 可自愈 | 退避后自动唤醒 |
 | **50151** | `LLM_CLUSTER_OVERLOADED` — 集群过载（HTTP 529） | ✅ 可自愈 | 退避后自动唤醒 |
 | 无错误码 + 文本含额度/鉴权信号 | 「用量上限」「未授权」等 | 🔴 需人工 | 不重试 |
 | 无错误码 + 文本含网络/服务端临时信号 | `net::ERR_NETWORK_CHANGED`、`ECONNRESET`、超时、`service unavailable` 等 | ✅ 可自愈 | 退避后自动唤醒 |
 | 无错误码 + 完全认不出的文本 | — | ✅ 可自愈（倾向） | 宁可多试一次，也不要让 bot 永久瘫着 |
-| 其它有结构的错误码（如 50111） | — | 🔴 需人工 | 「未知错误码，重试可能无用」 |
+| 其它有结构的错误码 | — | 🔴 需人工 | 「未知错误码，重试可能无用」 |
 
 > ⚠️ **「读不到」≠「没有」**：44 个 bot 会话里有 29 个是「无错误码、无错误消息」——
 > 它们只是闲置很久，并不是挂掉。若把这类判成可自愈，看门狗会去「重新启用」一批没坏的 bot。
@@ -221,6 +263,67 @@ MiniMax Bot 每失败一次就**新建一个会话**，所以一个反复挂掉�
 > 那个会话当时正在跑一个 20 多分钟的**正常长回合**，而它的 `error_code` 仍是 50113。
 > ⇒ 动手前必须同时确认「最近没有新活动」（`botGuard.idleMs`，默认 90 秒）。
 > 判据是 `local_runtime_message_rows` 里该会话的 `MAX(created_at_ms)`。
+
+### 唤醒请求的生命周期（代码常量，不是配置项）
+
+这三个常量**不在 `config.json` 里** —— 它们是「唤醒通道」的内部判据，
+Rust 守护进程与 Node 投递端**各有一份同值实现**（`bot_guard.rs` 与 `bot_wakeup.mjs`）。
+
+| 常量 | 值 | 作用 |
+| --- | --- | --- |
+| `MAX_WAKE_ATTEMPTS` / `MAX_ATTEMPTS` | **3** | 同一个请求最多试 3 次，超过就作废 |
+| `MAX_WAKE_REQUEST_AGE_MS` / `MAX_REQUEST_AGE_MS` | **24 小时** | **只是兜底**，防僵尸请求永久堆积 |
+| `ACK_SUPPRESS_WINDOW_MS` | **30 分钟** | 「最近被救过」的抑制窗口 |
+
+**为什么主判据是次数而不是时间**：
+纯时间 TTL 会让「面板关着」的场景彻底失效 ——
+面板关掉 ⇒ 没人消费请求 ⇒ 30 分钟后请求全部过期作废 ⇒
+等面板再打开时，那些 bot 又已经挂了一段时间，却**再也没有请求可发**。
+实测：面板关掉 70 秒后，7 条请求全部未被消费。
+
+真正的风险不是「放太久」，而是「**反复试同一个叫不醒的 bot**」
+（每次尝试都要烧一个 agent 回合）⇒ 按次数封顶。
+
+⇒ **教训**：**时效不是「多久算过期」，是「多久还值得试」。**
+只留一个时间上限的队列，在「消费者暂时不在」时会**静默丢单**。
+
+### acked 不再是永久黑名单
+
+`bot-revive-acked.json` 现在带时间戳：
+
+```json
+{
+  "acked": [
+    { "id": "bot-revive:bot_xxx:mvs_yyy", "atMs": 1792435772291 }
+  ]
+}
+```
+
+只抑制 **30 分钟**（`ACK_SUPPRESS_WINDOW_MS`），超过窗口可以再救。
+
+**为什么**：原来 acked 是个纯 id 列表 ⇒「救过一次」变成**永久黑名单**。
+实测：6 个 bot 明明又坏了（闲置 47~94 分钟，远超 90 秒阈值），
+却因为 acked 里有过它们而**永远不再被叫醒**。
+
+旧格式（纯字符串数组）仍能读 —— 视为「很久以前」，**不抑制**。
+
+### 唤醒会话复用（省 token）
+
+以前每次 `agent.run` 都不带 `sessionId` ⇒ 每次**新建一个会话** ⇒ 每次都是冷启动。
+现在把首次创建的会话 id 存进
+`~/.config/mcode-reset-card/bot-wake-host-session.json`，
+后续 `agent.run({text, sessionId})` **复用它**。
+
+| | 冷启动（每次新建会话） | 复用宿主会话 |
+| --- | --- | --- |
+| 单次唤醒 token | ≈ **93k** | 增量（系统提示与工具定义进上下文缓存） |
+| 一轮唤醒**新建**的会话数 | 每个 bot 一个 | **0**（全部复用同一个宿主会话） |
+
+**实测收益**：2026-10-20 02:39 一轮唤醒 6 个 bot ⇒ **新建的唤醒会话数为 0**。
+（运行时库里那一小时只有 **1** 条 `purpose='miniapp:expiry-guardian'` 的会话，它承载了 14 个 turn。）
+
+⚠️ 复用失败时会**自动退回新建**（会话被归档 / 凭据过期 / 会话不存在），
+但**只有** `BUSY` / `AGENT_OUTCOME_UNKNOWN` 除外 —— 见下面的「瞬时错误不重发」。
 
 ### 怎么把 bot 叫醒：两段跳
 
@@ -252,13 +355,88 @@ MiniMax Bot 每失败一次就**新建一个会话**，所以一个反复挂掉�
 > own Session all take the same path.
 
 ⇒ `session send` **不做 owner 检查** ⇒ 任何拿到 mavis 工具的会话都能唤醒任意 bot 会话。
-而 MiniApp 的 `agent.run`（不带 `sessionId`）建的会话 `agent_name = 'mavis'`
+而 MiniApp 的 `agent.run`（**首次**不带 `sessionId`）建的会话 `agent_name = 'mavis'`
 ⇒ 那个 agent 天然带桌面端 mavis 工具。
 
 > 💡 **这正好绕开了 `assertSessionOwnership`**：
 > 那个检查管的是「Mini App 能不能续**自己名下**的会话」，
 > 而 `session send` 走的是**另一条路**（工具调用，不是 MiniApp 会话续跑），
 > 它的准入条件是「目标可达即可」。
+
+### 瞬时错误不重发（v1.5）
+
+唤醒失败分两种，处理方式**相反**：
+
+| 错误 | 含义 | 处理 | 为什么 |
+| --- | --- | --- | --- |
+| `BUSY` / `session_busy` | 该会话**已有回合在飞** | **不是重发** —— 抛出去，交给下一轮 | 重发 = 往同一个会话里塞第二条续跑消息 |
+| `AGENT_OUTCOME_UNKNOWN` | 回合**可能已经跑了**（Host 标 never retryable） | **直接 ack，不重投** | 若只 bump 尝试次数而不 ack ⇒ 60 秒后下一轮会再投同一条 ⇒ bot 收到**两条**重复的「请从中断处继续」 |
+
+⚠️ 注意这两类**都不能**触发「宿主会话失效 ⇒ 退回新建会话」那条路：
+`BUSY` 说明会话是好的（只是忙），`AGENT_OUTCOME_UNKNOWN` 说明回合可能已经执行过了。
+
+⇒ **教训**：「失败」不等于「没送达」。
+把「不知道成没成」当成「没成」再投一次，是**重复投递**的经典来源。
+
+---
+
+## local MCP 端点
+
+蹬王之王对外暴露一个 **local MCP 端点**，别的插件可以在自己的回合里直接问它。
+
+| 项 | 值 |
+| --- | --- |
+| 实现 | `miniapp/node/mcp.mjs` |
+| 声明 | `miniapp/miniapp.json` 的 `mcpEndpoints` + 根目录 `servers.mcp.json` |
+| 路径 | `/mcp/expiry-guardian`（**并兼容** `/mcp/minimax-bot`） |
+| 传输 | streamable-http |
+
+三个工具：
+
+| 工具 | 作用 |
+| --- | --- |
+| `watchdog_status` | 查当前额度、重置卡/积分到期时间，以及**待唤醒队列**（含每个请求已试了几次） |
+| `watchdog_wake` | **立即**跑一轮 Bot 唤醒（不等 60 秒巡检） |
+| `watchdog_decide` | 立即判定一次：现在该不该用卡、用哪张、为什么（**只判定不扣卡**） |
+
+⚠️ **刻意不暴露「扣卡」**：扣卡是**真实写操作**（少一张卡），
+让别的插件随手就能扣太危险 ⇒ 要扣走面板按钮。
+
+⚠️ **声明了就得真实现**：Host 发布时会用 `initialize` + `tools/list` **探活**，
+探不通就**发布失败**。而且 Host 内存里的「已发布快照」是**粘的** ——
+一旦某个版本的 manifest 声明过 `mcpEndpoints`，
+后续版本**必须继续声明同样的端点**，否则 `miniapp publish` 会被
+`MCP_PUBLICATION_INVALID` 挡下（`used.size !== expected.size`）。
+⇒ 两条路径（`/mcp/expiry-guardian` 与 `/mcp/minimax-bot`）挂同一个 handler。
+
+---
+
+## 客户端 401 自愈
+
+面板显示「**实时连接中断**」且一直好不了，多半是**凭据失效**（401）而不是服务挂了。
+
+**根因**（2026-10-20 实测）：
+MiniApp 被 Host 重启后，它的 loopback 凭据会**换新**；
+而 Electron 主进程是按 **webContentsId** 注入凭据的（`miniapp-loopback-auth.js`），
+页面里的 fetch 拿不到新 token ⇒ 一直 401。
+更麻烦的是 `syncMiniAppLoopbackCredential` **只在 origin 不变时才同步**
+（重启后端口变了 ⇒ origin 变了 ⇒ 跳过）⇒ **光重试 fetch 无解**。
+
+⇒ 唯一能拿到新凭据的途径是**重新导航**（Host 在 `refreshMiniAppTab` /
+`openMiniAppTabOnce` 里同步 token）。
+
+客户端现在的做法：
+
+| 参数 | 值 | 作用 |
+| --- | --- | --- |
+| `STALE_RELOAD_THRESHOLD` | **3** | 连续 3 次 401 ⇒ `window.location.reload()` |
+| `MAX_RELOADS` | **5** | 重载次数上限（sessionStorage 记，**跨页面**） |
+
+- 没有上限会变成「重载后仍 401 ⇒ **无限重载**」⇒ 页面反复闪，用户根本没法用。
+- **成功一次就清零**（`staleCount` 与 sessionStorage 里的计数都清）——
+  原来只在「重连成功」时清、`load()` 成功不清 ⇒
+  「2 次 401 + 1 次成功 + 1 次 401」就会触发一次多余的整页重载。
+- 超过上限 ⇒ 不再重载，改为提示「请在 MiniMax Code 里重新打开「蹬王之王」面板」。
 
 ---
 
@@ -289,6 +467,7 @@ v1.3 的架构是「**守护进程判定 + 定时任务值守投递**」。
 │     · 把要唤醒的 bot 写进 bot-revive-requests.json                   │
 │     · 把要恢复的目标写进 goal-resume-requests.json                   │
 │   · 目标恢复：自己写「目标续跑队列项」（照抄运行时形状）⇒ 目标能自己醒 │
+│   · 也读 bot-revive-attempts.json（尝试次数）⇒ 不给叫不醒的 bot 无限重试│
 │   ❌ 不投递 bot 唤醒 ❌ 不碰 bot 会话的队列 ❌ 不碰任何定时任务          │
 └──────────────────────────────────────────────────────────────────────┘
                                   │  文件交接（不需要网络、不需要凭据）
@@ -296,13 +475,21 @@ v1.3 的架构是「**守护进程判定 + 定时任务值守投递**」。
 ┌──────────────────────────────────────────────────────────────────────┐
 │ Host 之内：蹬王之王自己的 MiniApp（Node 进程）                        │
 │                                                                      │
-│   ① 读 bot-revive-requests.json（跳过已 ack / 已过期的）             │
+│   ① 读 bot-revive-requests.json                                      │
+│      跳过：30 分钟内已 ack / 已试满 3 次 / 超过 24 小时                │
 │   ② agent.run 起一个回合（agent_name = 'mavis' ⇒ 天然带 mavis 工具） │
+│      ⚠️ 复用 bot-wake-host-session.json 里的宿主会话（省 93k 冷启动） │
 │   ③ 回合里的 agent 用 mavis 工具的 session send 送进目标 bot 会话    │
-│   ④ 成功则把 id 写进 bot-revive-acked.json（幂等）                    │
+│   ④ 成功 ⇒ 写 bot-revive-acked.json（带时间戳，只抑制 30 分钟）       │
+│      失败 ⇒ 写 bot-revive-attempts.json（+1，满 3 次作废）            │
 │   巡检间隔 60 秒                                                     │
 └──────────────────────────────────────────────────────────────────────┘
 ```
+
+> ⚠️ **Rust 与 Node 会并发写同一批文件**（各写各的，但文件相邻）。
+> 临时文件名必须带 pid，尝试次数必须**单独存一个文件** ——
+> 否则会互相覆盖对方的半成品，或把守护进程刚写的条目抹掉（lost update）。
+> 详见「踩过的坑」#15。
 
 ### 代价：每个被唤醒的 bot 要烧一个 agent 回合
 
@@ -318,9 +505,13 @@ v1.3 的架构是「**守护进程判定 + 定时任务值守投递**」。
 
 （代码注释里记的「47k」是**单次模型调用**的数：第二次调用 46.5k 全是缓存读。）
 
+⚠️ **93k 是「冷启动」的数字** —— 那是「每次 `agent.run` 都新建会话」时的代价。
+v1.5 起复用唤醒宿主会话（见[唤醒会话复用](#唤醒会话复用省-token)），
+系统提示与工具定义进上下文缓存 ⇒ 后续唤醒只付**增量**。
+
 ⇒ **只在真的有 pending 请求时才跑，绝不空转。**
 这条是硬约束：空转一天就是 24×60 = 1440 次 × 93k ≈ 134M tokens，
-比它要保护的额度还多。
+比它要保护的额度还多。（复用会话后这个数字会明显下降，但「不空转」仍然成立。）
 
 ### MiniApp 生命周期：没有常驻模式
 
@@ -417,11 +608,18 @@ Bot 会话超过 idleMs 没动静
   │
   ▼
 蹬王之王自己的 MiniApp（60 秒一轮）
-        ④ 读 bot-revive-requests.json（跳过已 ack / 超过 30 分钟 TTL 的）
+        ④ 读 bot-revive-requests.json
+           （跳过：30 分钟内已 ack / 已试满 3 次 / 超过 24 小时）
         ⑤ agent.run 起一个回合（agent_name = 'mavis'）
+           ⚠️ 复用 bot-wake-host-session.json 里的宿主会话（不新建 ⇒ 省冷启动）
         ⑥ 回合里的 agent 用 mavis 工具的 session send 送进目标 bot 会话
-        ⑦ 成功 ⇒ 把 id 写进 bot-revive-acked.json
+        ⑦ 成功 ⇒ 把 id 写进 bot-revive-acked.json（带时间戳，只抑制 30 分钟）
+           失败 ⇒ 把 id 写进 bot-revive-attempts.json（+1；满 3 次作废）
 ```
+
+> 💡 **④ 的跳过条件为什么要分开存**：
+> 「已 ack」与「已试满 3 次」是**两件事**，而「试满」的记录一旦被清掉就会**无限重试**。
+> ⇒ attempts 单独存一个文件，且**只按「已 ack」或「超龄」清**（见「踩过的坑」#15）。
 
 ### 完整的架构边界：谁能暂停、谁能起回合
 
@@ -509,7 +707,7 @@ Bot 会话超过 idleMs 没动静
 
 ---
 
-## 踩过的坑（十四个都写在这里了）
+## 踩过的坑（二十个都写在这里了）
 
 1. **Rust `format!` 不替换裸花括号** ⇒ `WHERE goal_id='{goal_id}'` 是字面量 ⇒ UPDATE 影响 0 行却退出码 0 ⇒ **假成功**。
    ⇒ 凡靠 UPDATE 改状态的判据，**必须回读校验**。「命令执行成功」≠「改到了行」。
@@ -580,6 +778,56 @@ Bot 会话超过 idleMs 没动静
     真正的送达记录在 `data_json.deliveryAttempts[]` 里，
     而**没有 `deliveryAttempts`** 的行 = 没人 claim = 没起过回合。
     ⇒ 判「有没有被唤醒」要看 `local_runtime_turn_ingress`，**不要**看队列表的状态列。
+
+15. **🆕 并发写同一个文件：三个坑**（2026-10-20 审计发现）——
+    守护进程（Rust，Host 之外）与投递端（Node，Host 之内）会**并发**写同一批文件。
+    - **临时文件名撞车**：两边原来都用 `.json.tmp` ⇒ 互相覆盖对方的半成品 ⇒ **丢请求**。
+      ⇒ 各自带 pid（Rust `json.{pid}.tmp` / Node `${file}.${pid}.tmp`）。
+    - **lost update**：投递端做「读全量 → 改字段 → 写回全量」会把守护进程刚写进去的条目
+      **一起抹掉**（两次写可能只隔几毫秒）。
+      ⇒ 尝试次数**单独存一个文件**（`bot-revive-attempts.json`），两边各写各的。
+    - **清理条件**：不能按「requests 文件里还在不在」清 attempts ——
+      Rust 的 prune 会删掉「次数用尽」的请求 ⇒ 连带把 attempts 记录删掉 ⇒
+      Rust 读到 0 ⇒ 重新入队 ⇒ 再试 3 次 ⇒ **3 次封顶被架空，变成无限重试**。
+      ⇒ 只按「已 ack」或「超龄」清。
+    ⇒ **教训**：跨进程交接的文件，**每一次写都要假设对方正在同时写**。
+
+16. **🆕 「救过一次」不等于「永远不救」**（2026-10-20 实测）——
+    acked 原来是个纯 id 列表 ⇒ 永久黑名单。
+    实测：6 个 bot 明明又坏了（闲置 47~94 分钟，远超 90 秒阈值），
+    却因为 acked 里有过它们而**永远不再被叫醒**。
+    ⇒ acked 带时间戳，只抑制 30 分钟；旧格式（纯字符串）视为「很久以前」，不抑制。
+
+17. **🆕 「不知道成没成」不能当成「没成」再投一次**（2026-10-20）——
+    `AGENT_OUTCOME_UNKNOWN`（回合可能已经跑了，Host 标 never retryable）
+    若只 bump 尝试次数而不 ack ⇒ 60 秒后下一轮会再投同一条
+    ⇒ bot 收到**两条**重复的「请从中断处继续」。
+    ⇒ 这类直接 ack，不重投。同理 `BUSY` / `session_busy`（会话已有回合在飞）也**不是重发**。
+
+18. **🆕 401 只重试 fetch 无解**（2026-10-20 实测）——
+    MiniApp 被 Host 重启后 loopback 凭据会换新；Electron 主进程按 **webContentsId**
+    注入凭据（`miniapp-loopback-auth.js`），页面的 fetch 拿不到新 token ⇒ 一直 401。
+    而 `syncMiniAppLoopbackCredential` 只在 origin 不变时才同步
+    （重启后端口变了 ⇒ 跳过）⇒ **光重试 fetch 无解**。
+    ⇒ 唯一能拿到新凭据的途径是**重新导航**。
+    客户端做法：连续 **3** 次 401 ⇒ `window.location.reload()`；
+    重载次数用 sessionStorage 记、**上限 5 次**（没上限会变成「重载后仍 401 ⇒ 无限重载」）；
+    成功一次就清零。
+
+19. **🆕 声明了 `mcpEndpoints` 就得真的实现**（2026-10-20）——
+    Host 发布时会用 `initialize` + `tools/list` 探活，探不通就发布失败。
+    而且 Host 内存里的「已发布快照」是**粘的**：一旦某个版本的 manifest 声明过端点，
+    后续版本**必须继续声明同样的端点**，否则 `miniapp publish` 被 `MCP_PUBLICATION_INVALID`
+    挡下（`used.size !== expected.size`）。
+    ⇒ 两条路径都挂同一个 handler（`/mcp/expiry-guardian` 与 `/mcp/minimax-bot`），
+    新旧路径都得能响应。
+
+20. **🆕 工作区与插件包各有一份测试，布局还不同**（2026-10-20 反复踩到）——
+    工作区在 `miniapps/expiry-guardian/miniapp/node/*.test.mjs`，
+    插件包在 `plugins/hylouis233/reset-card-autouse/tests/*.test.mjs`。
+    改了一边忘了另一边 ⇒ 插件包跑的是**旧测试**，出现「17/18」这种看不懂的结果。
+    ⇒ 新增 `check-test-parity.sh`：只比**测试文件内容**（归一化 import 路径与空白），
+    不一致就报错并 diff。
 
 ### 查运行时问题的入口
 
@@ -652,30 +900,47 @@ sqlite3 ~/.minimax/v2/sqlite/runtime-state.sqlite \
 第 3 层是刻意设计的。一个永远显示「一致」的校验器等于没有校验，
 所以必须证明它对已知错误会失败。
 
-Rust 单测 **48/48**（其中 8 个是 v1.1 新增的回归测试，每个对应上表的一个缺陷：
+Rust 单测 **51/51**（其中 8 个是 v1.1 新增的回归测试，每个对应上表的一个缺陷：
 `resume_sql_contains_the_real_goal_id`、`resume_goal_reports_missing_goal_instead_of_fake_success`、
 `session_id_whitelist`、`ledger_does_not_duplicate_existing_goal`、
 `runtime_rebound_is_not_user_handled`、`stale_started_requires_error_code`、
 `deleted_goal_is_treated_as_handled`、`purge_only_targets_our_own_resume_messages`）。
 
+MiniApp 单测 **112/112**：
+
+| 测试文件 | 覆盖 | 现状 |
+| --- | --- | --- |
+| `bot_wakeup.test.mjs` | 唤醒判据、attempts、acked 窗口、宿主会话复用 | **35/35** |
+| `config-fidelity.test.mjs` | 配置白名单重建不丢字段 | **15/15** |
+| `decision.test.mjs` | 扣卡决策分支 + 走重试路径 | **58/58** |
+| `retry.behavior.test.mjs` | 真实重试行为（mock server，不触网） | **4/4** |
+
 单独跑：
 
 ```bash
-cd daemon/rust && cargo test --release   # 48/48
+cd daemon/rust && cargo test --release   # 51/51
 cd daemon && python3 bg_decision.test.py # 20/20
 cd daemon && node verify-parity.mjs      # 三方逐字比对
 cd daemon && ./check-parity.sh           # 一次跑完
 cd miniapp && node node/decision.test.mjs        # 58/58
 cd miniapp && node node/config-fidelity.test.mjs # 15/15
-cd miniapp && node node/bot_wakeup.test.mjs      # 9/9
+cd miniapp && node node/bot_wakeup.test.mjs      # 35/35
+cd tests  && node retry.behavior.test.mjs         # 4/4
+./check-test-parity.sh                            # 工作区 ↔ 插件包测试一致？
 ```
 
-> ⚠️ **已知问题（2026-10-20）**：`verify-parity.mjs` 与 `tests/retry.behavior.test.mjs`
-> 都是用 `data:` URL 动态 import `miniapp/node/server.mjs` 来取 `decide()` /
-> `fetchWithRetry()` 的。v1.4 给 `server.mjs` 加了相对导入 `./bot_wakeup.mjs`，
-> `data:` URL 解析不了相对路径 ⇒ 两个脚本现在会报
-> `ERR_UNSUPPORTED_RESOLVE_REQUEST`。
-> 修法：改成把 `server.mjs` **写到临时文件**再 import（而不是 base64 进 `data:` URL）。
+> ⚠️ **已知问题（2026-10-20 仍未修）**：`daemon/verify-parity.mjs`（以及包着它的
+> `daemon/check-parity.sh`）是用 `data:` URL 动态 import `miniapp/node/server.mjs`
+> 来取 `decide()` 的。v1.4 给 `server.mjs` 加了相对导入 `./bot_wakeup.mjs`，
+> `data:` URL 解析不了相对路径 ⇒ 仍报 `ERR_UNSUPPORTED_RESOLVE_REQUEST`。
+> 修法：改成把 `server.mjs` **写到临时文件**再 import（而不是 base64 进 `data:` URL）——
+> `tests/retry.behavior.test.mjs` 已经这么改好了，可以直接照抄它的写法。
+
+> 💡 **为什么还需要 `check-test-parity.sh`**：
+> 工作区源码与插件包**各有一份测试文件**，而且路径布局不同
+> （工作区 `./x.mjs`，插件包 `../miniapp/node/x.mjs`）——
+> 改了一边忘了另一边，插件包跑的就是旧测试。
+> 这个脚本只比**测试文件的内容**（归一化 import 路径与空白），不一致就报错并 diff。
 
 ---
 
@@ -703,7 +968,9 @@ cd ~/mcode-reset-card-autouse/daemon/rust && cargo test --release
 
 # 看唤醒请求与回执（排查「bot 没被唤醒」）
 cat ~/.config/mcode-reset-card/bot-revive-requests.json   # 待投递
-cat ~/.config/mcode-reset-card/bot-revive-acked.json      # 已处理（幂等）
+cat ~/.config/mcode-reset-card/bot-revive-acked.json      # 已处理（带时间戳，30 分钟内抑制）
+cat ~/.config/mcode-reset-card/bot-revive-attempts.json   # 尝试次数（满 3 次作废）
+cat ~/.config/mcode-reset-card/bot-wake-host-session.json # 复用的唤醒宿主会话 id
 cat ~/.config/mcode-reset-card/bot-notified.json          # 「需要你处理」去重表
 ```
 
@@ -717,7 +984,9 @@ cat ~/.config/mcode-reset-card/bot-notified.json          # 「需要你处理�
 | `goal-resume-acked.json` | 守护进程 | 守护进程 | 幂等去重 |
 | `goal-revive.json` | 守护进程 | 守护进程 | 每个目标的唤醒尝试记录 |
 | `bot-revive-requests.json` | 守护进程 | **蹬王之王自己的 MiniApp** | 要唤醒的 bot（**唯一跨进程的交接**） |
-| `bot-revive-acked.json` | MiniApp | MiniApp | 幂等去重 |
+| `bot-revive-acked.json` | MiniApp | MiniApp + 守护进程 | 幂等去重，**带时间戳**，只抑制 30 分钟 |
+| `bot-revive-attempts.json` | MiniApp | MiniApp + 守护进程 | 每个请求的尝试次数（**满 3 次作废**）。单独存 ⇒ 避免 lost update |
+| `bot-wake-host-session.json` | MiniApp | MiniApp | 复用的唤醒宿主会话 id（省掉每次冷启动） |
 | `bot-notified.json` | 守护进程 | 守护进程 | 「需要你处理」提示去重（**防刷屏**） |
 | `bg-state.json` | 守护进程 | 守护进程 | 已尝试过的重置卡（防重复扣） |
 
@@ -761,10 +1030,18 @@ cat ~/.config/mcode-reset-card/bot-notified.json          # 「需要你处理�
 - **目标恢复**靠守护进程写**目标续跑队列项**（照抄运行时形状）。目标会话若长期闲置、
   或卡在一个未结束的回合里，外部注入只能排队 —— 需要在 MCode 里打开过那个会话。
 - **Bot 唤醒**靠蹬王之王自己的 MiniApp 起回合 + `session send`。
-  **面板关着时不会发生唤醒**（守护进程照常判定记账，面板再开时补上；请求 30 分钟过期）。
-- 每个被唤醒的 bot 要烧**一个 agent 回合**（实测 ≈ 93k tokens，其中 ≈ 51k 缓存读），
-  所以**只在真的有 pending 请求时才跑**。
+  **面板关着时不会发生唤醒**（守护进程照常判定记账，面板再开时补上；
+  请求按「最多试 3 次 + 24 小时兜底」判存活，不受面板关多久影响）。
+- 每个被唤醒的 bot 要烧**一个 agent 回合**（**冷启动**实测 ≈ 93k tokens，其中 ≈ 51k 缓存读；
+  v1.5 起复用唤醒宿主会话 ⇒ 只付增量），所以**只在真的有 pending 请求时才跑**。
 - 后台服务只管扣卡与目标暂停/恢复，**看板仍在 Mini App 里**（关掉面板即停，这是 MCode 的设计限制）。
+- **官方 `minimax-bot` 插件不可本地改版**（`miniapp publish` 会报 `OFFICIAL_PLUGIN_READ_ONLY`），
+  所以唤醒方**只能是蹬王之王自己的 MiniApp**（它有 `agentAccess: ["session.run"]`）。
+- ⚠️ **Host 侧有个已知问题**：一旦某个版本的 manifest 声明过 `mcpEndpoints`，
+  后续版本**必须继续声明同样的端点**，否则 `miniapp publish` 会被
+  `MCP_PUBLICATION_INVALID` 挡下（Host 内存里的「已发布快照」是粘的）。
+  当前工作区的部署方式是**直接同步到 `~/.minimax/plugins/expiry-guardian/`
+  安装副本 + `miniapp open`**，不走发布流程。
 
 ---
 

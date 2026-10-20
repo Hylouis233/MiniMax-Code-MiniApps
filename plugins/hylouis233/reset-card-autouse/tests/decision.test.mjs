@@ -17,6 +17,8 @@ writeFileSync(
     '\nexport { percent, amount, parsePlatformPools, parseCodeCredits, parseQuota, expiringWithin, decide, isRetryableStatus, retryDelayMs, RETRY_CAP_MS };',
 );
 copyFileSync(new URL('../miniapp/node/bot_wakeup.mjs', import.meta.url), join(modDir, 'bot_wakeup.mjs'));
+// server.mjs 还 import 了 ./mcp.mjs —— 一并复制（相对 import 才能解析）。
+copyFileSync(new URL('../miniapp/node/mcp.mjs', import.meta.url), join(modDir, 'mcp.mjs'));
 const mod = await import(modFile);
 
 const { decide, percent, amount, parsePlatformPools, parseCodeCredits, parseQuota, expiringWithin, isRetryableStatus, retryDelayMs, RETRY_CAP_MS } = mod;

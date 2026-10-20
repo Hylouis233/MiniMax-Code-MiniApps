@@ -1,20 +1,21 @@
 {
   "schemaVersion": 1,
-  "name": "reset-card-autouse",
+  "name": "expiry-guardian",
   "displayName": "蹬王之王",
-  "version": "1.4.0",
-  "description": "实时追踪积分与重置卡的到期时间，额度打满时自动暂停所有进行中的目标、额度回落后自动恢复并叫醒；无人值守后台守护进程配合 Mini App 看板，按「先过期先用」自动使用重置卡，遇到 500/429 等可重试错误会一直重试。v1.3 起彻底移除 cron 依赖：唤醒改由 Mini App 在 Host 内用 mavis 工具的 session send 投递，后台守护进程只做判定与记账。",
-  "author": "hylouis233",
+  "version": "1.5.0",
+  "description": "实时追踪积分与重置卡的到期时间，额度打满时自动暂停所有进行中的目标、额度回落后自动恢复并叫醒；无人值守后台守护进程配合 Mini App 看板，按「先过期先用」自动使用重置卡，遇到 500/429 等可重试错误会一直重试。v1.5 起唤醒链路全面加固：复用同一个会话（省掉每次约 93k tokens 的冷启动）、请求按尝试次数封顶而不是按时间过期（面板关久了也能补上）、acked 只抑制 30 分钟不再当永久黑名单。",
+  "author": "User",
   "icon": "icon.png",
   "category": "Productivity",
   "exampleQueries": [
     "打开蹬王之王，看我的积分和重置卡什么时候过期。",
     "我的额度快用完了，该用重置卡还是留着？",
-    "看看我有多少积分要过期了。",
-    "蹬王之王现在把我的目标暂停了吗？"
+    "看看我有多少积分要过期了。"
   ],
   "apps": [],
-  "mcpServers": [],
+  "mcpServers": [
+    "servers.mcp.json"
+  ],
   "skills": [],
   "darkIcon": "icon-dark.png"
 }

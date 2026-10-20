@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "mcpServers": {
+    "minimax-bot": {
+      "type": "streamable-http",
+      "url": "http://127.0.0.1:9/mcp/minimax-bot",
+      "headers": {},
+      "description": "\u8e6c\u738b\u4e4b\u738b local MCP endpoint: watchdog status, wake stuck Bots, and inspect the reset-card decision. The Host rewrites the URL to this Mini App's own origin at publish time.",
+      "timeout": 900000
+    },
+    "expiry-guardian": {
+      "type": "streamable-http",
+      "url": "http://127.0.0.1:9/mcp/expiry-guardian",
+      "headers": {},
+      "description": "\u8e6c\u738b\u4e4b\u738b local MCP endpoint. The Host rewrites the URL to this Mini App's own origin at publish time.",
+      "timeout": 900000
+    }
+  }
+}

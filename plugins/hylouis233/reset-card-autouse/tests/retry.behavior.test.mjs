@@ -20,6 +20,8 @@ writeFileSync(
     '\nexport { isRetryableStatus, retryDelayMs, RETRY_CAP_MS, fetchWithRetry };',
 );
 copyFileSync(new URL('../miniapp/node/bot_wakeup.mjs', import.meta.url), join(modDir, 'bot_wakeup.mjs'));
+// server.mjs 还 import 了 ./mcp.mjs —— 一并复制（相对 import 才能解析）。
+copyFileSync(new URL('../miniapp/node/mcp.mjs', import.meta.url), join(modDir, 'mcp.mjs'));
 const mod = await import(modFile);
 const { fetchWithRetry, RETRY_CAP_MS } = mod;
 

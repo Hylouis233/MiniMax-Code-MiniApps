@@ -23,7 +23,8 @@
 
 import { createServer } from 'node:http';
 import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, rmSync } from 'node:fs';
-import { tick as botWakeTick, WAKE_INTERVAL_MS } from './bot_wakeup.mjs';
+import { tick as botWakeTick, readWakeRequests, readAttemptsMap, WAKE_INTERVAL_MS } from './bot_wakeup.mjs';
+import { createMcpHandler } from './mcp.mjs';
 import { readFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { join, dirname } from 'node:path';
@@ -1493,12 +1494,76 @@ export async function start(context) {
   hostLogger = context.logger ?? null;
   const clientHtml = await readFile(join(context.pluginRoot, 'miniapp/client/index.html'));
 
+  // ── local MCP 端点 ──
+  //
+  // 声明了 `mcpEndpoints` 就必须真的实现它：Host 发布时会用
+  // `initialize` + `tools/list` 探活，探不通就发布失败。
+  //
+  // ⚠️ 刻意**不**暴露「扣卡」：扣卡是真实写操作（少一张卡），
+  // 让别的插件随手就能扣太危险。要扣走面板按钮。
+  const handleMcp = createMcpHandler({
+    status: async () => {
+      // 额度快照需要登录态；拿不到就只报 bot 那部分（不要让整个工具失败）。
+      let snapshot = null;
+      let quotaError = null;
+      try {
+        snapshot = await buildSnapshot();
+      } catch (e) {
+        quotaError = String(e?.message ?? e);
+      }
+      const pending = await readWakeRequests();
+      // ⚠️ attempts 单独存一个文件（bot-revive-attempts.json）——
+      // Rust 与 Node 会并发写 requests 文件，尝试次数不能内嵌在里面
+      // （否则会 lost update）。所以这里要单独读。
+      const attempts = readAttemptsMap();
+      return {
+        quota: snapshot?.quota ?? null,
+        decision: snapshot?.decision ?? null,
+        cards: snapshot?.cards ?? null,
+        quotaError,
+        pendingWakes: pending.map((r) => ({
+          id: r.id,
+          botName: r.botName,
+          sessionId: r.sessionId,
+          attempts: attempts.get(r.id) ?? 0,
+        })),
+      };
+    },
+    wake: async () => botWakeTick(context.agent),
+    decide: async () => {
+      const snapshot = await buildSnapshot();
+      return {
+        action: snapshot.decision?.action,
+        reason: snapshot.decision?.reason,
+        target: snapshot.decision?.target ?? null,
+      };
+    },
+  });
+
   const server = createServer((request, response) => {
     const url = new URL(request.url ?? '/', 'http://miniapp.local');
 
     if (request.method === 'GET' && url.pathname === '/dashboard') {
       response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       response.end(clientHtml);
+      return;
+    }
+
+    // ⚠️ 两条路径都挂同一个 handler。
+    //
+    // 原因：Host 的「已发布快照」是粘的 —— 它记着**上一版**声明的
+    // `mcpEndpoints.path`，发布时会用**旧 path** 拼 URL 去探活
+    // （`rewriteManagedMcpServers` 里 `new URL(replacement.path, replacement.origin)`，
+    // path 来自 accepted，不来自新 manifest）。
+    // ⇒ 新旧路径都得能响应，否则发布会被 `MCP_PUBLICATION_INVALID` 挡下。
+    if (url.pathname === '/mcp/expiry-guardian' || url.pathname === '/mcp/minimax-bot') {
+      const bodyPromise = request.method === 'POST' ? readJsonBody(request) : Promise.resolve(undefined);
+      bodyPromise
+        .then((body) => handleMcp(request, response, body))
+        .catch(() => {
+          response.writeHead(500, { 'content-type': 'application/json' });
+          response.end(JSON.stringify({ error: 'mcp handler failed' }));
+        });
       return;
     }
 
@@ -1774,6 +1839,36 @@ export async function start(context) {
   context.signal.addEventListener('abort', disposeAll, { once: true });
 
   return { dispose: disposeAll };
+}
+
+/**
+ * 读一个 JSON 请求体。
+ *
+ * MCP 的 `tools/call` 会带参数；解析失败时返回 undefined（让上层按
+ * 「Invalid Request」处理，而不是把整个连接搞崩）。
+ *
+ * @param {any} request
+ * @returns {Promise<any>}
+ */
+async function readJsonBody(request) {
+  const chunks = [];
+  let size = 0;
+  try {
+    for await (const chunk of request) {
+      size += chunk.length;
+      // MCP 请求很小；给个上限防止被撑爆。
+      if (size > 1_000_000) return undefined;
+      chunks.push(chunk);
+    }
+  } catch {
+    return undefined;
+  }
+  if (!chunks.length) return undefined;
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  } catch {
+    return undefined;
+  }
 }
 
 function describe(error) {

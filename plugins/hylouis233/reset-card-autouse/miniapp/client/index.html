@@ -1055,6 +1055,10 @@
             return;
           }
           authStale = false;
+          // ⚠️ 成功路径也要清 staleCount（2026-10-20 独立审计发现）：
+          // 原来只在「重连成功」时清，而 load() 成功不清 ⇒
+          // 「2 次 401 + 1 次成功 + 1 次 401」就会触发一次多余的整页重载。
+          staleCount = 0;
           stopReconnect();
           $('reconnect').hidden = true;
           render(r.data);
@@ -1087,6 +1091,12 @@
 
       // 指数退避：1s 起，上限 30s。避免服务重启期间把 Host 打爆。
       const RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 15000, 30000];
+      // 连续多少次 401 之后整页重载（重载是唯一能拿到新凭据的途径）。
+      const STALE_RELOAD_THRESHOLD = 3;
+      // 最多重载几次（跨页面计数）—— 没有上限会变成「重载后仍 401 ⇒ 无限重载」。
+      const MAX_RELOADS = 5;
+      /** 连续 401 的次数（成功一次就清零）。 */
+      let staleCount = 0;
 
       function startFallbackPoll() {
         if (fallbackTimer) return;
@@ -1111,8 +1121,46 @@
           reconnectTimer = null;
           try {
             const r = await fetchState();
+            if (r.kind === 'stale') {
+              // ⚠️ 401 = 凭据失效。
+              //
+              // 2026-10-20 实测的坑：MiniApp 在 Host 内被重启后，
+              // 它的 loopback 凭据会换新；而 Electron 主进程是按
+              // **webContentsId** 注入凭据的（`miniapp-loopback-auth.js`），
+              // 页面里的 fetch 拿不到新 token ⇒ 永远 401。
+              // 而且 `syncMiniAppLoopbackCredential` 只在 origin 不变时才同步
+              // （重启后端口变了 ⇒ origin 变了 ⇒ 跳过）⇒ 光重试 fetch 无解。
+              //
+              // ⇒ 唯一能拿到新凭据的途径是**重新导航**（Host 会在
+              // `refreshMiniAppTab` / `openMiniAppTabOnce` 里同步 token）。
+              // 连续 401 几次就整页重载一次，别在那儿空转。
+              staleCount += 1;
+              if (staleCount >= STALE_RELOAD_THRESHOLD) {
+                staleCount = 0;
+                // ⚠️ 重载次数要跨页面保留（sessionStorage），否则「重载后仍 401」
+                //    会变成无限重载循环 —— 页面反复闪，用户根本没法用。
+                const key = 'expiryGuardian.reloadCount';
+                // sessionStorage 在隐私模式 / 沙箱 iframe 里可能抛异常 ⇒ 全部包起来。
+                let n = 1;
+                try { n = Number(sessionStorage.getItem(key) ?? '0') + 1; } catch { n = 1; }
+                if (n > MAX_RELOADS) {
+                  try { sessionStorage.removeItem(key); } catch { /* 忽略 */ }
+                  renderFailure('Mini App 服务持续拒绝连接（已重载 ' + (n - 1) + ' 次）。请在 MiniMax Code 里重新打开「蹬王之王」面板。', false);
+                  $('reconnect').hidden = false;
+                  return;
+                }
+                try { sessionStorage.setItem(key, String(n)); } catch { /* 忽略 */ }
+                renderFailure('Mini App 已重启，正在重新载入面板…', true);
+                window.location.reload();
+                return;
+              }
+              scheduleReconnect();
+              return;
+            }
             if (r.kind === 'ok') {
               // 恢复了：停掉重连与降级轮询，重建 SSE，刷新页面数据
+              staleCount = 0;
+              try { sessionStorage.removeItem('expiryGuardian.reloadCount'); } catch { /* 忽略 */ }
               stopReconnect();
               stopFallbackPoll();
               authStale = false;
