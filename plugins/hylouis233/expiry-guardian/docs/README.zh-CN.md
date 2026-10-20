@@ -1006,7 +1006,7 @@ Bot 会话超过 idleMs 没动静
 
 20. **🆕 工作区与插件包各有一份测试，布局还不同**（2026-10-20 反复踩到）——
     工作区在 `miniapps/expiry-guardian/miniapp/node/*.test.mjs`，
-    插件包在 `plugins/hylouis233/reset-card-autouse/tests/*.test.mjs`。
+    插件包在 `plugins/hylouis233/expiry-guardian/tests/*.test.mjs`。
     改了一边忘了另一边 ⇒ 插件包跑的是**旧测试**，出现「17/18」这种看不懂的结果。
     ⇒ 新增 `check-test-parity.sh`：只比**测试文件内容**（归一化 import 路径与空白），
     不一致就报错并 diff。
@@ -1232,11 +1232,11 @@ tail -f /tmp/mcode-reset-card.err
 python3 ~/mcode-reset-card-autouse/reset_card_autouse.py --dry-run once
 
 # 跑测试
-cd ~/mcode-reset-card-autouse/daemon/rust && cargo test --release
+cd ~/mcode-reset-card-autouse/rust && cargo test --release
 
 # 看唤醒请求与回执（排查「bot 没被唤醒」）
 cat ~/.config/mcode-reset-card/bot-revive-requests.json   # 待投递
-cat ~/.config/mcode-reset-card/bot-revive-acked.json      # 已处理（带时间戳，30 分钟内抑制）
+cat ~/.config/mcode-reset-card/bot-revive-acked.json      # 已处理（带时间戳；**永久**记为「投递过」）
 cat ~/.config/mcode-reset-card/bot-revive-attempts.json   # 尝试次数（满 3 次作废）
 cat ~/.config/mcode-reset-card/bot-wake-host-session.json # 复用的唤醒宿主会话 id
 cat ~/.config/mcode-reset-card/bot-notified.json          # 「需要你处理」去重表

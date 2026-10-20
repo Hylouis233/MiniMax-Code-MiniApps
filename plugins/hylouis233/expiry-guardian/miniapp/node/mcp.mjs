@@ -81,7 +81,8 @@ export function createMcpHandler(deps) {
             serverInfo: { name: 'expiry-guardian', version: '1.6.0' },
             instructions:
               '蹬王之王：追踪额度与重置卡到期时间，并守护挂掉的 MiniMax Bot。' +
-              '用 watchdog_status 查状态、watchdog_wake 立即叫醒挂掉的 bot、watchdog_use_card 立即用掉该用的重置卡。',
+              '用 watchdog_status 查状态、watchdog_wake 立即叫醒挂掉的 bot、' +
+              'watchdog_decide 立即判定一次该不该用重置卡（**只判定不扣卡**）。',
           };
           break;
         }

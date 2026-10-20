@@ -2,7 +2,7 @@
 # 校验「工作区源码」与「插件包」**测试文件**保持一致。
 #
 # 2026-10-20 反复踩到的坑：工作区（miniapps/expiry-guardian/）与插件包
-# （plugins/hylouis233/reset-card-autouse/）各有一份测试，路径布局还不同
+# （plugins/hylouis233/expiry-guardian/）各有一份测试，路径布局还不同
 # （工作区是 `./x.mjs`，插件包是 `../miniapp/node/x.mjs`）。
 # 改了一边忘了另一边 ⇒ 插件包跑的是旧测试，出现「17/18」这种看不懂的结果。
 #

@@ -1558,7 +1558,11 @@ export async function start(context) {
     // （`rewriteManagedMcpServers` 里 `new URL(replacement.path, replacement.origin)`，
     // path 来自 accepted，不来自新 manifest）。
     // ⇒ 新旧路径都得能响应，否则发布会被 `MCP_PUBLICATION_INVALID` 挡下。
-    if (url.pathname === '/mcp/expiry-guardian' || url.pathname === '/mcp/minimax-bot') {
+    // ⚠️ 端点只保留一个（`expiry-guardian`）。
+    // 旧版本还挂过 `/mcp/minimax-bot` 这条路径（当时的 manifest 声明过它），
+    // 现在 manifest 与 `servers.mcp.json` 都只声明 `expiry-guardian` 一个端点，
+    // 留着旧路径只会让人以为本插件抢了官方插件的名字 ⇒ 删掉。
+    if (url.pathname === '/mcp/expiry-guardian') {
       const bodyPromise = request.method === 'POST' ? readJsonBody(request) : Promise.resolve(undefined);
       bodyPromise
         .then((body) => handleMcp(request, response, body))

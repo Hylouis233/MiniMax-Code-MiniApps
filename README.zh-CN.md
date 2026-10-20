@@ -64,7 +64,7 @@ MiniMax Code Agent 通过宿主 MCP 客户端与 MiniApp 协作。业务请求�
 | --- | --- | --- |
 | [AI 事务所](plugins/cristinamadureira353-svg/ai-office/README.zh-CN.md) | 五位真实模型员工的像素事务所：接单、聊天、休息和开会，额度耗尽时角色暂停；使用玩家自己的 API Key | [最爱双皮奶](https://github.com/cristinamadureira353-svg) |
 | [Bot 看门狗](plugins/hylouis233/bot-watchdog/README.md) | 盯住 MiniMax Bot 团队：某个 bot 因服务端内部错误或网络抖动挂掉时，复用它原来的会话自动重新启用；额度到顶这类重试无用的问题则如实提示 | [Hylouis](https://github.com/Hylouis233) |
-| [蹬王之王](plugins/hylouis233/reset-card-autouse/README.zh-CN.md) | 追踪积分与重置卡到期，5 小时额度打满时自动暂停目标、回落后自动恢复并叫醒；后台守护进程 + 实时看板 | [Hylouis](https://github.com/Hylouis233) |
+| [蹬王之王](plugins/hylouis233/expiry-guardian/README.zh-CN.md) | 追踪积分与重置卡到期，5 小时额度打满时自动暂停目标、回落后自动恢复并叫醒；后台守护进程 + 实时看板 | [Hylouis](https://github.com/Hylouis233) |
 | [Token 用量看板](plugins/amszuidas/mcode-token-usage-board/README.zh-CN.md) | 按时间、模型和会话查看本机 Token 用量，包含输入、输出和缓存用量 | [amszuidas](https://github.com/amszuidas) |
 | [Token 用量看板](plugins/yanhy2000/mcode-usage-monitor/README.zh-CN.md) | 近实时查看本机 Token 用量、输出速度与缓存命中率，可按时间范围、模型和会话筛选 | [yanhy2000](https://github.com/yanhy2000) |
 | [模型管理器](plugins/ocoomber/openrouter-model-manager/README.zh-CN.md) | 浏览、搜索并启用/停用 `~/.minimax/config.yaml` 中的模型，支持即时保存、批量操作、一键撤销和自动备份 | [ocoomber](https://github.com/ocoomber) |
