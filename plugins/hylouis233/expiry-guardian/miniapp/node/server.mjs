@@ -1,24 +1,17 @@
 // @ts-check
 /**
- * 蹬王之王 — 积分与重置卡的到期决策看板。
+ * 蹬王之王 — 积分与重置卡的到期决策看板（v2.0 只读版）。
  *
- * 数据源（全部经实测确认，非推测）。两套 API 分属不同域名：
+ * 数据源：**本地账本** `~/.config/mcode-reset-card/ledger.json`（用户自己维护）。
  *
- *   开放平台积分 → www.minimaxi.com
- *     GET  /backend/account/token_plan_credit      → 余额 + 各积分池到期时间
- *     GET  /backend/account/token_plan/remains_percent → 5小时/周额度用量
- *     GET  /backend/account/reset_card/list        → 重置卡与到期时间
- *     POST /backend/account/reset_card/use          → 使用一张重置卡
- *
- *   MiniMax Code 积分 → agent.minimaxi.com
- *     GET  /minimax-cloud/api/v1/credit/details    → 逐笔授予/消耗/到期明细
+ * ⚠️ v2.0 为什么不再自己调接口（2026-10-20 管理员 review）：
+ * 社区插件不能读取 MiniMax Code 的登录凭据，也不能读写宿主的内部数据库、
+ * 不能读其它插件的数据目录 ⇒ 额度/积分/重置卡的信息改由本地账本提供。
+ * 本插件**只读**，不做任何写操作（不扣卡、不暂停目标）。
  *
  * 决策规则：把「最早到期的积分」（平台或 Code 任一）与「最早到期的重置卡」比，
  * 谁先过期先用谁。积分先过期 → 不用卡，让积分先消耗完；重置卡先过期 → 用卡
  * 把额度重置回来，把更耐放的积分留着。
- *
- * 鉴权：与桌面端共用同一登录态，经 OAuth lease socket 取短期 access token。
- * 凭据只在本进程内存中使用，绝不下发给页面、绝不写日志。
  */
 
 import { createServer } from 'node:http';
