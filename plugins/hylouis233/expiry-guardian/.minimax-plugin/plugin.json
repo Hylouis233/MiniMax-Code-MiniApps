@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "name": "expiry-guardian",
+  "displayName": "蹬王之王",
+  "version": "1.6.0",
+  "description": "实时追踪积分与重置卡的到期时间，额度打满时自动暂停所有进行中的目标、额度回落后自动恢复并叫醒；无人值守后台守护进程配合 Mini App 看板，按「先过期先用」自动使用重置卡，遇到 500/429 等可重试错误会一直重试。v1.6 修掉一个让 Bot 守护完全静默的真 bug（minimax-bot 状态文件里一个被截断的代理对转义导致严格 JSON 解析失败），并新增唤醒链路自检：宿主重启后运行时没起来时如实告警、投递空转时也能发现，绝不再「看起来一切正常、实际一个 bot 都没叫醒」。",
+  "author": "User",
+  "icon": "icon.png",
+  "category": "Productivity",
+  "exampleQueries": [
+    "打开蹬王之王，看我的积分和重置卡什么时候过期。",
+    "我的额度快用完了，该用重置卡还是留着？",
+    "看看我有多少积分要过期了。"
+  ],
+  "apps": [],
+  "mcpServers": [
+    "servers.mcp.json"
+  ],
+  "skills": [],
+  "darkIcon": "icon-dark.png"
+}
