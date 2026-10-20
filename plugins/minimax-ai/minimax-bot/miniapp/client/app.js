@@ -325,10 +325,6 @@ function renderAll() {
 function liveLabel(m) {
   if (!m.live) return '';
   if (typeof m.live === 'string') return m.live;
-  // 暂时性错误的无限重试没有次数上限 ⇒ 换一条不带 n/max 的文案。
-  if (m.live?.key === 'live.retrying' && !m.live.params?.max) {
-    return tOr('live.retryingForever', m.live.params, '');
-  }
   return tOr(m.live.key, m.live.params, '');
 }
 

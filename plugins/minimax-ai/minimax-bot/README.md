@@ -28,30 +28,36 @@ Copy this directory, including the hidden `.minimax-plugin/` directory, into the
 - **Language**: English and Chinese. By default it follows the operating system's preferred language (the first English or Chinese entry in `navigator.languages`; other languages fall back to English), or you can fix it under Settings → General → Language. The interface, errors, system notices, Chief's default setup, the context Bots receive and the MCP tool descriptions all switch; replies the Bots wrote and text you entered stay as they are.
 - **Reactions**: react to finished Bot replies in private and group chats. The quick bar offers 👍 ❤️ 🙌 😂 😭 😮, and more emoji can be browsed by category or searched in English or Chinese. Each message holds one reaction: picking a new one replaces it, and picking the same one again removes it. Reactions are saved locally, survive refreshes and restarts, and sync to other open windows. They do not trigger a Bot reply and are not sent to the model.
 
-## 0.7.4 Transient failures retry until they succeed
+## 0.7.5 Transient failures get a longer, still-capped retry window
 
 A Bot that died from a **temporary** failure now comes back on its own.
 
 The Host classifies a generic 5xx as `LLM_UPSTREAM_ERROR` (50113) and deliberately
 fails closed on it: that code is a catch-all bucket for *any* status of 400 or above
-except 402/401/403/429/529, so retrying it could turn an HTTP 400 or 404 into ten
-identical attempts. The result is that a plain HTTP 500 — which usually clears on
-its own within seconds — kills the turn on the first try.
+except 402/401/403/429/529, so retrying it blindly could turn an HTTP 400 or 404
+into ten identical attempts. The result is that a plain HTTP 500 — which usually
+clears on its own within seconds — killed the turn on the first try.
 
 This plugin sees the error **message**, so it can tell the two apart. Failures that
-name a transient condition are retried until they succeed, with an exponential
-backoff capped at 60 seconds:
+name a transient condition (a network error, a 5xx, a gateway timeout, rate limiting,
+an overloaded model) are retried; failures that are a decision rather than a glitch
+are not.
 
-| Error | Behaviour |
-| --- | --- |
-| `net::ERR_NETWORK_CHANGED`, connection reset, timeout | Retried until it succeeds |
-| `Internal server error (500)`, `502 Bad Gateway`, `520` | Retried until it succeeds |
-| The model is busy, rate limited, overloaded | Retried until it succeeds |
-| `Token Plan` limit reached, credits exhausted, login expired | **Not retried** — only topping up fixes it |
-| HTTP 400 / 404 and other rejections | **Not retried** — the server already refused the request |
+What changed in 0.7.5:
 
-The waiting Bot shows how long it will wait and how many attempts it has made.
-Stopping the Bot or restarting the Mini App ends the wait immediately.
+- **The retry window is longer.** 0.7.4 retried **twice** (after 8 s and 20 s), so a
+  blip that lasted 30 seconds killed the Bot. The window is now
+  `8s → 20s → 40s → 60s × 7` — ten attempts over roughly **eight minutes**, which
+  covers the overwhelming majority of transient outages.
+- **There is still a cap.** After the last attempt the original error surfaces as
+  it is. The window is also still the single knob: injecting
+  `retryDelaysMs: []` keeps meaning "do not retry at all".
+- **400 / 404 / 422 are never retried.** Retrying them only repeats the same
+  rejection ten times.
+- **The message match is narrow.** It requires an explicit server-side or network
+  shape (`net::ERR_NETWORK_CHANGED`, `Internal server error (500)`, `502 Bad
+  Gateway`, `rate limit exceeded`, `HTTP 500`, …), so ordinary text such as
+  "used 400 tokens" or "step 404 done" is never mistaken for an error.
 
 ## 0.7.0 Reliable delegation and result delivery
 
