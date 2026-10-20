@@ -18,6 +18,8 @@ PAIRS=(
   "bot_wakeup.test.mjs"
   "config-fidelity.test.mjs"
   "decision.test.mjs"
+  "mcp.test.mjs"
+  "server-lint.test.mjs"
 )
 
 fail=0

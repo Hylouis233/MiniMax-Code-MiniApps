@@ -78,7 +78,7 @@ export function createMcpHandler(deps) {
           result = {
             protocolVersion: PROTOCOL_VERSIONS.includes(requested) ? requested : PROTOCOL_VERSIONS[0],
             capabilities: { tools: { listChanged: false } },
-            serverInfo: { name: 'expiry-guardian', version: '1.4.0' },
+            serverInfo: { name: 'expiry-guardian', version: '1.6.0' },
             instructions:
               '蹬王之王：追踪额度与重置卡到期时间，并守护挂掉的 MiniMax Bot。' +
               '用 watchdog_status 查状态、watchdog_wake 立即叫醒挂掉的 bot、watchdog_use_card 立即用掉该用的重置卡。',
@@ -95,7 +95,11 @@ export function createMcpHandler(deps) {
           const name = params?.name;
           const args = params?.arguments ?? {};
           if (name === 'watchdog_status') {
-            result = { content: [{ type: 'text', text: JSON.stringify(deps.status(), null, 2) }] };
+            // ⚠️ **必须 await**（2026-10-20 实测发现）：
+            // `deps.status()` 是 async ⇒ 不 await 拿到的是 **Promise**，
+            // 而 `JSON.stringify(Promise)` 得到的是字符串 `"{}"`
+            // ⇒ 工具永远返回空对象，调用方什么也看不到。
+            result = { content: [{ type: 'text', text: JSON.stringify(await deps.status(), null, 2) }] };
           } else if (name === 'watchdog_wake') {
             const r = await deps.wake();
             result = { content: [{ type: 'text', text: JSON.stringify(r, null, 2) }] };
