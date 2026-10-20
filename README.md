@@ -61,6 +61,8 @@ The MiniMax Code Agent communicates through the host MCP client. Business reques
 
 | MiniApp | What it does | Author |
 | --- | --- | --- |
+| [MiniMax Photo](plugins/webguhui/minimax-photo/) | Layered image editing with an in-app AI assistant, local recovery and programmatic editing tools | [WebGuHui](https://github.com/WebGuHui) |
+| [OpenVideo](plugins/webguhui/openchatcut/) | Local video editing with captions, a host Agent assistant, reviewable timeline edits, and MP4/MP3 export | [WebGuHui](https://github.com/WebGuHui) |
 | [AI Office](plugins/cristinamadureira353-svg/ai-office/) | Manage five model-powered employees in a pixel office: client tasks, chats, breaks, meetings and quota-aware offline states; uses your own API keys | [最爱双皮奶](https://github.com/cristinamadureira353-svg) |
 | [蹬王之王 · Expiry Guardian](plugins/hylouis233/expiry-guardian/) | Track credit and reset-card expiry, pause goals when the 5-hour quota runs out, and resume them once it comes back — a headless daemon plus a live dashboard | [Hylouis](https://github.com/Hylouis233) |
 | [Token Usage Board](plugins/amszuidas/mcode-token-usage-board/) | Explore local Token usage by date, model, and session, including input, output, and cache usage | [amszuidas](https://github.com/amszuidas) |
@@ -76,6 +78,8 @@ The MiniMax Code Agent communicates through the host MCP client. Business reques
 | [心屿 / Xinyu Island](plugins/yujiachen-y/xinyu-daily/) | A cozy daily-mood island that plays like an indie game: an inspiration card shaped by your answers, mood stickers, a joy jar, a decision slot machine, a Book of Answers, and 20 hidden secrets guarded by a grumpy crab. Optionally, Xiaoyu writes you a daily letter and chats with you using your model. Requires MiniMax Code 3.1.2 or later | [yujiachen-y](https://github.com/yujiachen-y) |
 | [MoMo Collab](plugins/amszuidas/momo-collab/) | A project steward that turns stray thoughts, screenshots, and links into ideas, writes clear ideas up as tasks, runs each task in its own Agent session with a full handoff, checks the result against your done criteria, and tracks everything on a board. Requires MiniMax Code 3.1.2 or later | [amszuidas](https://github.com/amszuidas) |
 | [Anatomy Gallery](plugins/zch0227/anatomy-gallery/) | A gallery for interactive isometric figures made with the anatomy skill: hang them in rooms you organize, view light and dark editions full screen, keep every version, and have an Agent create or edit figures from the gallery with a per-run process log. The anatomy skill is bundled. Requires MiniMax Code 3.1.2 or later | [zch0227](https://github.com/zch0227) |
+| [仓库透视 / Repo X-Ray](plugins/yujiachen-y/repo-xray/) | Understand a codebase from its Git history: a code map you can drill into, hotspots and bug magnets, high-risk files, owners and knowledge loss, commit rhythm and firefighting, and the tech stack. Works with GitHub, GitLab, and local repositories; analysis runs on your machine | [yujiachen-y](https://github.com/yujiachen-y) |
+| [Disk Insight](plugins/zch0227/disk-insight/) | See where disk space went on macOS and Windows with a sunburst space map, find junk files sorted into three safety tiers, large and duplicate files, and how much code repositories and Git worktrees take; ask an Agent about any item, and permanently delete what you select after a confirmation that lists every item. Requires MiniMax Code 3.1.2 or later | [zch0227](https://github.com/zch0227) |
 
 <details>
 <summary>Preview: Token Usage Board</summary>

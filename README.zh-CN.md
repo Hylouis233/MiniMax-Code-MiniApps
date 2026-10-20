@@ -62,6 +62,8 @@ MiniMax Code Agent 通过宿主 MCP 客户端与 MiniApp 协作。业务请求�
 
 | MiniApp | 功能 | 作者 |
 | --- | --- | --- |
+| [MiniMax Photo](plugins/webguhui/minimax-photo/) | 图层图片编辑、应用内 AI 助手、本地恢复与程序化编辑工具 | [WebGuHui](https://github.com/WebGuHui) |
+| [OpenVideo](plugins/webguhui/openchatcut/) | 本地视频剪辑、字幕、宿主 Agent 助手、可预览的时间线修改与 MP4/MP3 导出 | [WebGuHui](https://github.com/WebGuHui) |
 | [AI 事务所](plugins/cristinamadureira353-svg/ai-office/README.zh-CN.md) | 五位真实模型员工的像素事务所：接单、聊天、休息和开会，额度耗尽时角色暂停；使用玩家自己的 API Key | [最爱双皮奶](https://github.com/cristinamadureira353-svg) |
 | [蹬王之王](plugins/hylouis233/expiry-guardian/README.zh-CN.md) | 追踪积分与重置卡到期，5 小时额度打满时自动暂停目标、回落后自动恢复并叫醒；后台守护进程 + 实时看板 | [Hylouis](https://github.com/Hylouis233) |
 | [Token 用量看板](plugins/amszuidas/mcode-token-usage-board/README.zh-CN.md) | 按时间、模型和会话查看本机 Token 用量，包含输入、输出和缓存用量 | [amszuidas](https://github.com/amszuidas) |
@@ -77,6 +79,8 @@ MiniMax Code Agent 通过宿主 MCP 客户端与 MiniApp 协作。业务请求�
 | [心屿](plugins/yujiachen-y/xinyu-daily/README.zh-CN.md) | 像独立小游戏的每日心情小岛：由你的回答决定的今日灵感卡、心情贴纸、小确幸罐子、纠结老虎机、答案之书，还有坏脾气螃蟹藏起来的 20 个秘密；可选开启小屿陪伴，借用你的模型每天写信、陪你聊天。需要 MiniMax Code 3.1.2 或更高版本 | [yujiachen-y](https://github.com/yujiachen-y) |
 | [协作 · MoMo](plugins/amszuidas/momo-collab/README.zh-CN.md) | 项目管家 MoMo：把随手的想法、截图和链接攒成想法，写清后变成任务，派 Agent 会话带着完整背景去执行，按验收标准核对结果后交你审核，进展在看板上一眼可见。需要 MiniMax Code 3.1.2 或更高版本 | [amszuidas](https://github.com/amszuidas) |
 | [Anatomy 画廊](plugins/zch0227/anatomy-gallery/README.zh-CN.md) | 集中展示 anatomy 技能做出的交互式等距图解：按自建展区挂墙，全屏查看明暗两版，保留全部历史版本；在画廊里让 Agent 新建或修改作品，每次运行都有过程记录。自带 anatomy 技能。需要 MiniMax Code 3.1.2 或更高版本 | [zch0227](https://github.com/zch0227) |
+| [仓库透视](plugins/yujiachen-y/repo-xray/README.zh-CN.md) | 从 Git 历史看懂一个代码仓库：可逐层下钻的代码地图、热点与 Bug 磁铁、高风险文件、负责人与知识流失、提交节奏与救火记录、技术栈；支持 GitHub、GitLab 和本机仓库，全部在本机分析 | [yujiachen-y](https://github.com/yujiachen-y) |
+| [磁盘透视](plugins/zch0227/disk-insight/README.zh-CN.md) | 查看 macOS 和 Windows 的磁盘空间去向：旭日图空间地图，按三档风险分类的垃圾文件，大文件和重复文件，代码仓库和 Git worktree 的占用；任何条目都可以问 Agent，选中的条目在确认框里逐一列出，确认后直接永久删除。需要 MiniMax Code 3.1.2 或更高版本 | [zch0227](https://github.com/zch0227) |
 
 <details>
 <summary>预览：Token 用量看板</summary>
