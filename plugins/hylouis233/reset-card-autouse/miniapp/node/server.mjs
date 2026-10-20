@@ -23,7 +23,7 @@
 
 import { createServer } from 'node:http';
 import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, rmSync } from 'node:fs';
-import { tick as botWakeTick, readWakeRequests, readAttemptsMap, WAKE_INTERVAL_MS } from './bot_wakeup.mjs';
+import { tick as botWakeTick, readWakeRequests, readAttemptsMap, botKeyFromRequestId, WAKE_INTERVAL_MS } from './bot_wakeup.mjs';
 import { createMcpHandler } from './mcp.mjs';
 import { readFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
@@ -1024,7 +1024,7 @@ async function doBuildSnapshot() {
   //        而扣卡是真实写操作，宁可等下一轮。
   //   - 本轮失败且无旧值（value=null）⇒ 完全没数据 ⇒ 同样不完整。
   const creditDataComplete =
-    !platformRes.fromCache && !codeRes.fromCache && platformRaw != null && codePage != null;
+    !platform.fromCache && !codeRes.fromCache && platformRaw != null && codePage != null;
   const decision = decide({
     platformPools,
     codeCredits: codeCredits.items,
@@ -1525,7 +1525,9 @@ export async function start(context) {
           id: r.id,
           botName: r.botName,
           sessionId: r.sessionId,
-          attempts: attempts.get(r.id) ?? 0,
+          // ⚠️ 尝试次数按 **bot 键**记（v1.6 协议：请求 id 带实例后缀，
+          // 换实例不重置计数）⇒ 这里必须折成 bot 键，否则永远报 0。
+          attempts: attempts.get(botKeyFromRequestId(r.id)) ?? 0,
         })),
       };
     },

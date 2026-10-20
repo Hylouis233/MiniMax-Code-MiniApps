@@ -168,9 +168,12 @@ export async function readWakeRequests() {
   const now = Date.now();
   return (Array.isArray(parsed?.requests) ? parsed.requests : []).filter((r) => {
     const id = String(r?.id ?? '');
+    // ⚠️ acked 是**永久**的：投递过的请求就是投递过了 ⇒ 绝不重投。
     if (!id || acked.has(id)) return false;
     // 尝试次数用尽 ⇒ 这个 bot 叫不醒（或者投递端有问题）⇒ 不再重试。
-    const attempts = attemptsMap.get(id) ?? Number(r?.attempts ?? 0);
+    // ⚠️ 尝试次数按 **bot 键**记（不是实例 id）——
+    // 否则守护进程每换一个实例就重置计数，3 次封顶会被架空。
+    const attempts = attemptsMap.get(botKeyFromRequestId(id)) ?? 0;
     if (attempts >= MAX_ATTEMPTS) return false;
     // 时间上限只当作「兜底」（比如 bot 早就恢复健康了却还挂着请求），
     // 但要留得足够久，覆盖「面板关了一整夜」这种场景。
@@ -180,7 +183,12 @@ export async function readWakeRequests() {
 }
 
 /**
- * 把某个请求的尝试次数 +1（失败时调用）。
+ * 把某个 bot 的尝试次数 +1（失败时调用）。
+ *
+ * ⚠️ **键是 bot 键，不是请求实例 id**（2026-10-20 v1.6）：
+ * 守护进程每写一次新实例就是一个新 id，若按 id 计次数，
+ * 每次换实例都会重置计数 ⇒ 3 次封顶被架空 ⇒ 无限重试。
+ * ⇒ 传 `botKeyFromRequestId(req.id)`。
  *
  * ⚠️ **为什么单独存一份 attempts，而不是直接改 requests 文件**（2026-10-20 审计发现）：
  * 蹬王之王的守护进程（Rust，Host 之外）会**并发**往同一个 requests 文件里写新请求。
@@ -220,14 +228,20 @@ export async function bumpAttempts(id) {
   // 而「已 ack」的条目本来就该清（它已经处理完了）；
   // 「超龄」也该清（僵尸记录）。其余一律保留。
   const nowMs = Date.now();
-  const acked = readAckedMap();
+  // ⚠️ **v1.6 修正：清理条件里不能有「已 ack」**（2026-10-20 二轮独立审计 F1）。
+  //
+  // 原来这里有 `done = acked.has(k)`（键 = bot 键）。而 v1.6 把 acked 改成**永久**之后，
+  // 它的含义从「刚刚被救过」变成了「**曾经**被救过」
+  // ⇒ 一个被救过的 bot，它的**失败计数**会在**同一次 bumpAttempts 调用里**被清掉
+  // ⇒ **3 次封顶彻底失效** ⇒ 该请求永远「活」⇒ 每 60 秒重投一次
+  // ⇒ 每轮烧一个 agent 回合（≈47k~93k tokens）。
+  //
+  // ⇒ 失败计数**只在成功时清**（见 `clearAttemptsOnSuccess`），这里只按**超龄**清理。
   const kept = {};
   for (const [k, v] of Object.entries(map)) {
-    const ackedAt = acked.get(k) ?? 0;
-    const done = ackedAt > 0 && nowMs - ackedAt <= ACK_SUPPRESS_WINDOW_MS;
     const at = v && typeof v === 'object' ? Number(v.at ?? 0) : 0;
     const tooOld = at > 0 && nowMs - at > MAX_ATTEMPT_AGE_MS;
-    if (!done && !tooOld) kept[k] = v;
+    if (!tooOld) kept[k] = v;
   }
   const entries = Object.entries(kept);
   const trimmed = entries.length > MAX_ATTEMPT_ENTRIES ? entries.slice(-MAX_ATTEMPT_ENTRIES) : entries;
@@ -237,7 +251,38 @@ export async function bumpAttempts(id) {
   await rename(tmp, file);
 }
 
-/** 读出所有已尝试次数（键 = 请求 id）。 */
+/**
+ * 投递**成功**时清掉这个 bot 的失败计数。
+ *
+ * ⚠️ 为什么必须在「成功」时清，而不是在「失败时按 acked 清理」
+ *   （2026-10-20 二轮独立审计 F1）：acked 现在是**永久**的
+ *   ⇒ 「按 acked 清理」会把「**曾经**被救过」的 bot 的失败计数也清掉
+ *   ⇒ 3 次封顶失效 ⇒ 无限重投。
+ * ⇒ 失败计数的语义是「这个 bot 最近连续投递失败了几次」，
+ *   **成功一次就该归零** —— 只在这里归零。
+ *
+ * @param {string} botKey
+ */
+export async function clearAttemptsOnSuccess(botKey) {
+  const key = String(botKey ?? '');
+  if (!key) return;
+  const file = attemptsFile();
+  let parsed;
+  try {
+    parsed = JSON.parse(await readFile(file, 'utf8'));
+  } catch {
+    return; // 文件不存在 ⇒ 没有失败计数要清
+  }
+  const map = parsed?.attempts && typeof parsed.attempts === 'object' ? parsed.attempts : {};
+  if (!(key in map)) return;
+  delete map[key];
+  await mkdir(dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.tmp`;
+  await writeFile(tmp, `${JSON.stringify({ attempts: map }, null, 2)}\n`, 'utf8');
+  await rename(tmp, file);
+}
+
+/** 读出所有已尝试次数（键 = bot 键）。 */
 export function readAttemptsMap() {
   try {
     const v = JSON.parse(readFileSync(attemptsFile(), 'utf8'));
@@ -255,15 +300,15 @@ export function readAttemptsMap() {
 }
 
 /**
- * 「最近被救过」的请求 id → 被救的时间戳。
+ * 「已被投递方确认处理」的请求 id → 处理时间戳。
  *
- * ⚠️ **为什么要带时间戳、还要有窗口**（2026-10-20 独立审计发现）：
+ * ⚠️ **为什么要带时间戳**（2026-10-20 独立审计发现）：
  * 原来 acked 是个纯 id 列表 ⇒ 「救过一次」变成**永久黑名单**。
  * 实测：6 个 bot 明明又坏了（闲置 47~94 分钟，远超 90 秒阈值），
  * 却因为 acked 里有过它们而永远不再被叫醒。
- * ⇒ 改成「最近 30 分钟内救过就不再重复救；超过窗口可以再救」。
+ * ⇒ 时间戳保留下来。
  *
- * 兼容旧格式（纯字符串数组 ⇒ 没有时间戳 ⇒ 视为「很久以前」，不再抑制）。
+ * 兼容旧格式（纯字符串数组 ⇒ 没有时间戳 ⇒ 视为「很久以前」）。
  */
 function readAckedMap() {
   try {
@@ -282,14 +327,35 @@ function readAckedMap() {
   }
 }
 
-/** 只返回「最近被救过、且还在抑制窗口内」的请求 id。 */
+/**
+ * 所有「已被投递方确认处理」的请求 id —— **永久**，不看时间窗。
+ *
+ * ⚠️ v1.6 改判据（2026-10-20 独立审计 + 实测）：
+ * 原来带 30 分钟窗口 ⇒ 窗口一过，**已经投递过的请求又变回「未处理」**
+ * ⇒ 投递端**每 30 分钟把同一条请求重投一次**（每回合 ≈47k tokens），
+ * 而且会打断已经恢复正常的 bot。
+ * ⇒ 现在：**投递过的就是投递过了**。
+ * 「多久可以再救同一个 bot」由**守护进程自己的频率限制**管（它写请求时判断）。
+ */
 function readAcked() {
-  const now = Date.now();
-  const out = new Set();
-  for (const [id, at] of readAckedMap()) {
-    if (at > 0 && now - at <= ACK_SUPPRESS_WINDOW_MS) out.add(id);
-  }
-  return out;
+  return new Set(readAckedMap().keys());
+}
+
+/**
+ * 从请求 id 推出 **bot 键**（= `bot-revive:{botId}:{sessionId}`，不含实例序号）。
+ *
+ * 请求 id 的形状：`bot-revive:{botId}:{sessionId}[:{实例序号}]` ⇒ 取前三段。
+ *
+ * ⚠️ **Rust 侧必须用同一个算法**（`bot_key_from_request_id`）——
+ * 它是「尝试次数」的键，两边不一致 ⇒ 3 次封顶被架空。
+ *
+ * @param {string} id
+ * @returns {string}
+ */
+export function botKeyFromRequestId(id) {
+  const parts = String(id ?? '').split(':');
+  if (parts.length >= 3) return `${parts[0]}:${parts[1]}:${parts[2]}`;
+  return String(id ?? '');
 }
 
 /**
@@ -435,8 +501,10 @@ async function runRound(agent) {
         // 一轮要几分钟（每个 bot 一个 agent 回合），而巡检间隔只有 60 秒。
         // 不立刻 ack 的话，下一轮会读到同一批未 ack 的请求 ⇒ 重复唤醒 + 双倍 token。
         await appendAcked([req.id]);
+        // 成功一次 ⇒ 这个 bot 的失败计数归零（见 clearAttemptsOnSuccess 的说明）。
+        await clearAttemptsOnSuccess(botKeyFromRequestId(req.id));
       } else {
-        await bumpAttempts(req.id);
+        await bumpAttempts(botKeyFromRequestId(req.id));
         failed.push({ id: req.id, detail: `唤醒回合未成功：${errText || r?.status || '未知'}` });
       }
     } catch (e) {
@@ -450,7 +518,7 @@ async function runRound(agent) {
         failed.push({ id: req.id, detail: '回合结果未知（可能已执行），不再重试' });
         continue;
       }
-      await bumpAttempts(req.id);
+      await bumpAttempts(botKeyFromRequestId(req.id));
       failed.push({ id: req.id, detail: `唤醒异常：${e?.message ?? e}` });
     }
   }

@@ -1059,6 +1059,11 @@
           // 原来只在「重连成功」时清，而 load() 成功不清 ⇒
           // 「2 次 401 + 1 次成功 + 1 次 401」就会触发一次多余的整页重载。
           staleCount = 0;
+          // ⚠️ **load() 成功也要清 reloadCount**（2026-10-20 独立审计 F10）：
+          // 原来只在「重连定时器里 fetch 成功」时清它 ⇒
+          // 同一标签页第 6 次 MiniApp 重启事件就不再触发整页重载，
+          // 页面会永久停在「正在重连」。
+          try { sessionStorage.removeItem('expiryGuardian.reloadCount'); } catch { /* 忽略 */ }
           stopReconnect();
           $('reconnect').hidden = true;
           render(r.data);

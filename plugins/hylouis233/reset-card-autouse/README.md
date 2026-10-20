@@ -17,6 +17,36 @@ when that is the right move, and resumes the goals once the quota comes back.
 | **Card selection** | "Expiring first" policy: if the card expires before the credits, spend the card; if the credits expire first, let the credits burn first and keep the card. |
 | **Headless** | The daemon keeps running with MiniMax Code closed, after logout, and while the machine sleeps. |
 
+### v1.6 — silent failures made loud (2026-10-20, night)
+
+The theme: **stop letting "everything looks fine" coexist with "not a single Bot was
+actually watched or woken"** — and fix three real bugs found in production.
+
+| Change | Effect |
+| --- | --- |
+| **Lenient JSON parsing for the Bot roster** | `minimax-bot`'s `state.json` contains a **truncated surrogate escape** (`\ud83d`). Python and Node parse it; **Rust's `serde_json` rejects it** ⇒ the roster came back empty ⇒ the **entire Bot watchdog went blind** — the daemon ran, the log was clean, and **zero Bots were being watched**. Measured: before the fix, 4 restarts over 45 minutes produced **no watchdog log lines at all**; after it, "checked 45" immediately |
+| **Judge "is it broken?" by the latest *turn*, not by the session's `error_code`** | `error_code` is a **stale value** (the runtime never clears it). Measured on 2026-10-20 15:39: the old rule wrote **11** wake-up requests, of which **8 were false positives** — those 8 Bots' latest turn was `completed` (perfectly healthy); the error code was left over from an earlier failure. After the fix the same batch reported "0 self-healing, 0 dispatched", and only the **2 genuinely broken** Bots were woken |
+| **Acked made permanent + request ids made per-instance** | The 30-minute ack window was doing **two** jobs at once: "has this been dispatched?" and "how soon may I rescue this Bot again?". ⇒ Once the window expired, an **already-delivered** request became "undelivered" again ⇒ the delivery side **re-dispatched it every 30 minutes** (≈47k tokens per turn) and interrupted Bots that had already recovered. Now: "dispatched" is **permanent** (keyed by the per-instance request id), the rescue interval is a **separate 30-minute rate limit** owned by the daemon, and every write gets a **fresh instance id** so the two never collide |
+| **A roster that cannot be read is now announced** | The old code was `if bots.is_empty() { return }` — **not a single word logged**. "The roster can't be read" was completely invisible ⇒ the daemon looked healthy while **watching nothing**. Now it says so explicitly, once per distinct cause |
+| **New wake-up self-check (`bot_bootstrap.rs`)** | After a host restart the Mini App is not started automatically ⇒ "decide" keeps working while "deliver" idles. The daemon now **says so** instead of going quiet, and also detects **delivery spinning** (runtime up, backlog never shrinking) |
+| **Runtime-liveness check rewritten** | It used a **hard-coded port (55932)** — the host's default allocation — and that port belongs to the **host process**, not necessarily to this Mini App. Now: a **live process** whose **cwd is this plugin's runtime package** and whose `package.json` **or** `.minimax-plugin/plugin.json` has `name == expiry-guardian` |
+| **A documented conclusion corrected** | The docs used to say "waking does not happen while the panel is closed" — **inaccurate**. Measured: the runtime kept running for **44 minutes** with the panel closed and kept delivering. The real gap is a **host restart** |
+| **`miniapp publish` fixed** | The manifest's MCP endpoint set did not match the host's in-memory "published snapshot". Declare **exactly one** endpoint (`server=expiry-guardian`, `path=/mcp/expiry-guardian`) + the matching `servers.mcp.json` + `"mcpServers": ["servers.mcp.json"]` in `plugin.json` ⇒ publish succeeds (verified twice) |
+| **Several "says something false" branches fixed** | A cleared backlog no longer claims "the runtime recovered"; a *growing* backlog no longer claims "delivery resumed" (only a *shrinking* one does); a failing `lsof` is reported as "the check is broken", not "the runtime is down"; a repeated self-check failure is logged once; surrogate ranges are matched exactly (U+D000–D7FF are ordinary characters, not surrogates) |
+
+| 11 | 🔴 **A typo in the dashboard's data layer broke the whole panel** | `doBuildSnapshot()` wrote `platform` as `platformRes` ⇒ `ReferenceError` ⇒ **`buildSnapshot()` throws outright** ⇒ quota, decision, reset cards and credits all unavailable ⇒ **the panel was broken**. The typo was introduced in **v1.2** (`fd98d98`) and survived four releases. It went unnoticed because the unit tests cover the pure `decide()` function — **the data layer itself was never executed** |
+| 12 | 🔴 **The `watchdog_status` MCP tool always returned `{}`** | `deps.status()` is `async`, but the handler never awaited it ⇒ it got a **Promise** ⇒ `JSON.stringify(Promise)` is the string `"{}"`. (`watchdog_wake` and `watchdog_decide` *are* awaited — only `status` was missed.) |
+| 13 | ✅ **Two regression tests added** (both bugs survived purely because nothing covered them) | `mcp.test.mjs` (18 checks): MCP protocol, the three tools, **an `async` status must really be awaited** (otherwise it is `"{}"`), and an unknown tool must fail loudly. `server-lint.test.mjs` (5 checks): a static guard for "used but never declared" identifiers — reintroducing the typo makes it fail (5/5 → 3/5) |
+
+| 14 | 🔴 **The 3-attempt cap was voided again** (2nd audit) | After acked became *permanent*, "clean up the failure count for acked bots" changed meaning from "just rescued" to "**ever** rescued" ⇒ a rescued bot's failure count was wiped ⇒ **the 3-attempt cap stopped working** ⇒ the request stayed alive forever ⇒ **re-delivered every 60 seconds** (≈47k–93k tokens per turn). Now the failure count is cleared **only on success**; the failure path cleans up by age only |
+| 15 | 🔴 **The parser could panic** (2nd audit) | `parse_lenient_json` sliced a `&str` by **byte** offsets ⇒ a slice landing inside a multi-byte character **panics** ⇒ the whole daemon dies (and launchd restarts it into the same crash). Trigger: strict parsing fails **and** the file contains a backslash-u escape followed by non-ASCII (the production `state.json` has 895k non-ASCII characters). Now parsed at the **byte** level, plus a `catch_unwind` around the Bot watchdog so a panic there cannot take down quota handling and goal resuming |
+| 16 | 🟠 **"No turn record" was a dead branch** (2nd audit) | The judgment layer said `None => !is_idle(...)` while the caller immediately did `if !is_idle(...) { continue; }` — the two **negate each other** ⇒ such sessions could never be rescued. Now the decision is handed to the downstream `classify_error` + `is_idle` checks |
+| 17 | 🟠 **"Zombie turns" are no longer ignored forever** (2nd audit) | `accepted` means both "running" and "**left behind by a host crash**" (the production DB has 3 such zombies, the oldest stuck for 2 hours, on sessions with self-healing error codes) ⇒ the new rule treated them as "running" ⇒ rescuable bots were never rescued. Now: stuck in `accepted` for more than **1 hour** ⇒ treated as stuck and rescued |
+| 18 | 🟡 **lsof parsing switched to field mode** | The default table mode splits on whitespace ⇒ a **path containing spaces** is chopped up ⇒ `ends_with("/package")` is never true ⇒ "the runtime is down" is reported every round. Now uses `lsof -F` (the `n` field keeps spaces) |
+
+Tests: Rust **75/75**, Python **20/20**, MiniApp **144/144**
+(bot_wakeup 44 + config-fidelity 15 + decision 58 + mcp 18 + server-lint 5 + retry.behavior 4).
+
 ### v1.5 — architecture hardening (2026-10-20, evening)
 
 The architecture is unchanged: the Rust daemon **decides and records**, this
@@ -280,9 +310,12 @@ only the delivery path.
   unfinished turn, cannot be woken from outside — open that session in MiniMax Code
   once so the runtime has a live session to attach to.
 - **The Mini App has no resident mode.** The Host accepts `lifecycle: "background"`
-  in the manifest but forces it back to `"on-demand"` when it reads it, so the
-  delivery loop only runs while the panel is open. The daemon keeps deciding and
-  recording while the panel is closed; the wake-ups are delivered when it opens again.
+  in the manifest but forces it back to `"on-demand"` when it reads it. Measured
+  (2026-10-20): the runtime kept running for **44 minutes** with the panel closed
+  and kept delivering — the idle drain only fires after a lease is released, and a
+  lease is only held while a turn is running. The real gap is a **host restart**:
+  the Host does not start any Mini App automatically afterwards. The daemon now
+  detects that case and says so explicitly instead of going quiet.
 - Each wake costs one agent turn (≈93k tokens when cold; an increment once the
   host session is reused), and a Bot that fails with a rate-limit error (50150)
   may need another attempt on a later round.

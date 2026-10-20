@@ -148,6 +148,121 @@ console.log('\n=== 面板关久了，请求不能因超时被丢掉（按尝试�
   process.env.HOME = prevHome2;
 }
 
+console.log('\n=== v1.6：已投递的请求永远不再投（acked 永久化）===');
+// 2026-10-20 独立审计 + 实测发现：acked 原来带 30 分钟窗口，
+// 窗口一过，**已经投递过的请求又变回「未处理」**
+// ⇒ 投递端每 30 分钟把同一条请求重投一次（每回合 ≈47k tokens），
+// 而且会打断已经恢复正常的 bot。
+{
+  const home3 = mkdtempSync(join(tmpdir(), 'expiry-wake-'));
+  const d3 = join(home3, '.config', 'mcode-reset-card');
+  mkdirSync(d3, { recursive: true });
+  const LONG_AGO = Date.now() - 60 * 60 * 1000; // 1 小时前（远超 30 分钟窗口）
+  writeFileSync(
+    join(d3, 'bot-revive-requests.json'),
+    JSON.stringify({
+      requests: [
+        { id: 'bot-revive:b1:mvs_1:111', botName: 'A', sessionId: 'mvs_0000000000000000000000000000aaaa', text: 'x', atMs: LONG_AGO },
+        { id: 'bot-revive:b2:mvs_2:222', botName: 'B', sessionId: 'mvs_0000000000000000000000000000bbbb', text: 'x', atMs: Date.now() },
+      ],
+    }),
+  );
+  // 1 小时前投递过第一条（带时间戳）。
+  writeFileSync(
+    join(d3, 'bot-revive-acked.json'),
+    JSON.stringify({ acked: [{ id: 'bot-revive:b1:mvs_1:111', atMs: LONG_AGO }] }),
+  );
+  const prevHome3 = process.env.HOME;
+  process.env.HOME = home3;
+  const reqs3 = await mod.readWakeRequests();
+  const ids3 = reqs3.map((r) => r.id);
+  check('超过 30 分钟窗口，已投递过的请求**仍然不投**', !ids3.includes('bot-revive:b1:mvs_1:111'), ids3.join(','));
+  check('没投递过的照常投', ids3.includes('bot-revive:b2:mvs_2:222'), ids3.join(','));
+  process.env.HOME = prevHome3;
+}
+
+console.log('\n=== v1.6：尝试次数按 bot 键记（换实例不重置计数）===');
+// 守护进程每写一次新实例就是一个新 id ⇒ 若按 id 计次数，
+// 每次换实例都重置 ⇒ 3 次封顶被架空 ⇒ 无限重试。
+{
+  const home4 = mkdtempSync(join(tmpdir(), 'expiry-wake-'));
+  const d4 = join(home4, '.config', 'mcode-reset-card');
+  mkdirSync(d4, { recursive: true });
+  writeFileSync(
+    join(d4, 'bot-revive-requests.json'),
+    JSON.stringify({
+      requests: [
+        { id: 'bot-revive:b1:mvs_1:999', botName: 'A', sessionId: 'mvs_0000000000000000000000000000aaaa', text: 'x', atMs: Date.now() },
+      ],
+    }),
+  );
+  // 3 次尝试记在 **bot 键**上（不是实例 id）。
+  writeFileSync(
+    join(d4, 'bot-revive-attempts.json'),
+    JSON.stringify({ attempts: { 'bot-revive:b1:mvs_1': { n: 3, at: Date.now() } } }),
+  );
+  const prevHome4 = process.env.HOME;
+  process.env.HOME = home4;
+  const reqs4 = await mod.readWakeRequests();
+  check('同一 bot 的新实例同样被 3 次封顶挡住', reqs4.length === 0, `剩 ${reqs4.length} 条`);
+  process.env.HOME = prevHome4;
+}
+
+console.log('\n=== v1.6：bot 键的推导规则必须与 Rust 侧逐字一致 ===');
+{
+  check('带实例后缀 ⇒ 取前三段', mod.botKeyFromRequestId('bot-revive:b1:mvs_1:111') === 'bot-revive:b1:mvs_1');
+  check('不带实例后缀 ⇒ 原样', mod.botKeyFromRequestId('bot-revive:b1:mvs_1') === 'bot-revive:b1:mvs_1');
+  check('形状不对 ⇒ 原样返回（不瞎折）', mod.botKeyFromRequestId('weird') === 'weird');
+}
+
+console.log('\n=== v1.6 二轮审计 F1：失败计数不能被「曾被救过」清掉 ===');
+// 回归：acked 永久化之后，「按 acked 清理 attempts」会把**曾经被救过**的 bot
+// 的失败计数一起清掉 ⇒ 3 次封顶失效 ⇒ 该请求永远「活」⇒ 每 60 秒重投一次。
+{
+  const home5 = mkdtempSync(join(tmpdir(), 'expiry-wake-'));
+  const d5 = join(home5, '.config', 'mcode-reset-card');
+  mkdirSync(d5, { recursive: true });
+  // 这个 bot 曾经被救过（acked 里有它）。
+  writeFileSync(
+    join(d5, 'bot-revive-acked.json'),
+    JSON.stringify({ acked: [{ id: 'bot-revive:b1:mvs_1:111', atMs: Date.now() }] }),
+  );
+  // 已经有 2 次失败记录（bot 键）。
+  writeFileSync(
+    join(d5, 'bot-revive-attempts.json'),
+    JSON.stringify({ attempts: { 'bot-revive:b1:mvs_1': { n: 2, at: Date.now() } } }),
+  );
+  const prevHome5 = process.env.HOME;
+  process.env.HOME = home5;
+  // 再失败一次 ⇒ 计数必须是 3，而不是被清成 0/1。
+  await mod.bumpAttempts('bot-revive:b1:mvs_1');
+  const map = JSON.parse(readFileSync(join(d5, 'bot-revive-attempts.json'), 'utf8')).attempts ?? {};
+  check(
+    '失败计数累加到 3（没被 acked 清掉）',
+    map['bot-revive:b1:mvs_1']?.n === 3,
+    JSON.stringify(map['bot-revive:b1:mvs_1']),
+  );
+  check('计数表没被清空', Object.keys(map).length >= 1, `剩 ${Object.keys(map).length} 条`);
+  process.env.HOME = prevHome5;
+}
+
+console.log('\n=== v1.6：投递成功时失败计数归零 ===');
+{
+  const home6 = mkdtempSync(join(tmpdir(), 'expiry-wake-'));
+  const d6 = join(home6, '.config', 'mcode-reset-card');
+  mkdirSync(d6, { recursive: true });
+  writeFileSync(
+    join(d6, 'bot-revive-attempts.json'),
+    JSON.stringify({ attempts: { 'bot-revive:b1:mvs_1': { n: 2, at: Date.now() } } }),
+  );
+  const prevHome6 = process.env.HOME;
+  process.env.HOME = home6;
+  await mod.clearAttemptsOnSuccess('bot-revive:b1:mvs_1');
+  const map = JSON.parse(readFileSync(join(d6, 'bot-revive-attempts.json'), 'utf8')).attempts ?? {};
+  check('成功后失败计数归零', !('bot-revive:b1:mvs_1' in map), JSON.stringify(map));
+  process.env.HOME = prevHome6;
+}
+
 console.log('\n=== 尝试次数单独存一个文件（不与守护进程抢同一个文件）===');
 // 2026-10-20 审计发现：投递端与守护进程会并发写 requests 文件。
 // 若投递端做「读全量 → 改字段 → 写回全量」，会把守护进程刚写进去的条目抹掉。
