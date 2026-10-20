@@ -168,9 +168,12 @@ export async function readWakeRequests() {
   const now = Date.now();
   return (Array.isArray(parsed?.requests) ? parsed.requests : []).filter((r) => {
     const id = String(r?.id ?? '');
+    // ⚠️ acked 是**永久**的：投递过的请求就是投递过了 ⇒ 绝不重投。
     if (!id || acked.has(id)) return false;
     // 尝试次数用尽 ⇒ 这个 bot 叫不醒（或者投递端有问题）⇒ 不再重试。
-    const attempts = attemptsMap.get(id) ?? Number(r?.attempts ?? 0);
+    // ⚠️ 尝试次数按 **bot 键**记（不是实例 id）——
+    // 否则守护进程每换一个实例就重置计数，3 次封顶会被架空。
+    const attempts = attemptsMap.get(botKeyFromRequestId(id)) ?? 0;
     if (attempts >= MAX_ATTEMPTS) return false;
     // 时间上限只当作「兜底」（比如 bot 早就恢复健康了却还挂着请求），
     // 但要留得足够久，覆盖「面板关了一整夜」这种场景。
@@ -180,7 +183,12 @@ export async function readWakeRequests() {
 }
 
 /**
- * 把某个请求的尝试次数 +1（失败时调用）。
+ * 把某个 bot 的尝试次数 +1（失败时调用）。
+ *
+ * ⚠️ **键是 bot 键，不是请求实例 id**（2026-10-20 v1.6）：
+ * 守护进程每写一次新实例就是一个新 id，若按 id 计次数，
+ * 每次换实例都会重置计数 ⇒ 3 次封顶被架空 ⇒ 无限重试。
+ * ⇒ 传 `botKeyFromRequestId(req.id)`。
  *
  * ⚠️ **为什么单独存一份 attempts，而不是直接改 requests 文件**（2026-10-20 审计发现）：
  * 蹬王之王的守护进程（Rust，Host 之外）会**并发**往同一个 requests 文件里写新请求。
@@ -221,10 +229,11 @@ export async function bumpAttempts(id) {
   // 「超龄」也该清（僵尸记录）。其余一律保留。
   const nowMs = Date.now();
   const acked = readAckedMap();
+  // ⚠️ attempts 的键是 **bot 键**，而 acked 的键是**实例 id** ⇒ 比较时折成 bot 键。
+  const ackedBotKeys = new Set([...acked.keys()].map((k) => botKeyFromRequestId(k)));
   const kept = {};
   for (const [k, v] of Object.entries(map)) {
-    const ackedAt = acked.get(k) ?? 0;
-    const done = ackedAt > 0 && nowMs - ackedAt <= ACK_SUPPRESS_WINDOW_MS;
+    const done = ackedBotKeys.has(k);
     const at = v && typeof v === 'object' ? Number(v.at ?? 0) : 0;
     const tooOld = at > 0 && nowMs - at > MAX_ATTEMPT_AGE_MS;
     if (!done && !tooOld) kept[k] = v;
@@ -255,15 +264,15 @@ export function readAttemptsMap() {
 }
 
 /**
- * 「最近被救过」的请求 id → 被救的时间戳。
+ * 「已被投递方确认处理」的请求 id → 处理时间戳。
  *
- * ⚠️ **为什么要带时间戳、还要有窗口**（2026-10-20 独立审计发现）：
+ * ⚠️ **为什么要带时间戳**（2026-10-20 独立审计发现）：
  * 原来 acked 是个纯 id 列表 ⇒ 「救过一次」变成**永久黑名单**。
  * 实测：6 个 bot 明明又坏了（闲置 47~94 分钟，远超 90 秒阈值），
  * 却因为 acked 里有过它们而永远不再被叫醒。
- * ⇒ 改成「最近 30 分钟内救过就不再重复救；超过窗口可以再救」。
+ * ⇒ 时间戳保留下来。
  *
- * 兼容旧格式（纯字符串数组 ⇒ 没有时间戳 ⇒ 视为「很久以前」，不再抑制）。
+ * 兼容旧格式（纯字符串数组 ⇒ 没有时间戳 ⇒ 视为「很久以前」）。
  */
 function readAckedMap() {
   try {
@@ -282,14 +291,35 @@ function readAckedMap() {
   }
 }
 
-/** 只返回「最近被救过、且还在抑制窗口内」的请求 id。 */
+/**
+ * 所有「已被投递方确认处理」的请求 id —— **永久**，不看时间窗。
+ *
+ * ⚠️ v1.6 改判据（2026-10-20 独立审计 + 实测）：
+ * 原来带 30 分钟窗口 ⇒ 窗口一过，**已经投递过的请求又变回「未处理」**
+ * ⇒ 投递端**每 30 分钟把同一条请求重投一次**（每回合 ≈47k tokens），
+ * 而且会打断已经恢复正常的 bot。
+ * ⇒ 现在：**投递过的就是投递过了**。
+ * 「多久可以再救同一个 bot」由**守护进程自己的频率限制**管（它写请求时判断）。
+ */
 function readAcked() {
-  const now = Date.now();
-  const out = new Set();
-  for (const [id, at] of readAckedMap()) {
-    if (at > 0 && now - at <= ACK_SUPPRESS_WINDOW_MS) out.add(id);
-  }
-  return out;
+  return new Set(readAckedMap().keys());
+}
+
+/**
+ * 从请求 id 推出 **bot 键**（= `bot-revive:{botId}:{sessionId}`，不含实例序号）。
+ *
+ * 请求 id 的形状：`bot-revive:{botId}:{sessionId}[:{实例序号}]` ⇒ 取前三段。
+ *
+ * ⚠️ **Rust 侧必须用同一个算法**（`bot_key_from_request_id`）——
+ * 它是「尝试次数」的键，两边不一致 ⇒ 3 次封顶被架空。
+ *
+ * @param {string} id
+ * @returns {string}
+ */
+export function botKeyFromRequestId(id) {
+  const parts = String(id ?? '').split(':');
+  if (parts.length >= 3) return `${parts[0]}:${parts[1]}:${parts[2]}`;
+  return String(id ?? '');
 }
 
 /**
@@ -436,7 +466,7 @@ async function runRound(agent) {
         // 不立刻 ack 的话，下一轮会读到同一批未 ack 的请求 ⇒ 重复唤醒 + 双倍 token。
         await appendAcked([req.id]);
       } else {
-        await bumpAttempts(req.id);
+        await bumpAttempts(botKeyFromRequestId(req.id));
         failed.push({ id: req.id, detail: `唤醒回合未成功：${errText || r?.status || '未知'}` });
       }
     } catch (e) {
@@ -450,7 +480,7 @@ async function runRound(agent) {
         failed.push({ id: req.id, detail: '回合结果未知（可能已执行），不再重试' });
         continue;
       }
-      await bumpAttempts(req.id);
+      await bumpAttempts(botKeyFromRequestId(req.id));
       failed.push({ id: req.id, detail: `唤醒异常：${e?.message ?? e}` });
     }
   }

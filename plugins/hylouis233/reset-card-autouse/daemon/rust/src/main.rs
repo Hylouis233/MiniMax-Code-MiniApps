@@ -11,6 +11,7 @@
 mod api;
 mod config;
 mod decision;
+mod bot_bootstrap;
 mod bot_guard;
 mod goal_sync;
 mod goal_wake;
@@ -25,6 +26,13 @@ use decision::{
     UsableCard, QUOTA_FIVE_HOUR,
 };
 use serde_json::json;
+
+/// 「投递空转」的判定门槛：待唤醒请求的积压条数连续多少轮没变就告警。
+///
+/// 取 15 轮：巡检间隔 60 秒 ⇒ 约 15 分钟。
+/// ⚠️ 不能更短 —— 一轮唤醒要给每个 bot 起一个 agent 回合，
+/// 实测一批要跑几分钟，期间积压条数确实不会变（成功一个才 ack 一个）。
+const STUCK_STREAK_ROUNDS: u32 = 15;
 
 /// 把 Unix 毫秒格式化成「10月19日 19:41」这样的本地时间。
 ///
@@ -121,6 +129,15 @@ struct Daemon {
     client: Client,
     ttl: Ttl,
     cache: Caches,
+    /// 上次报告过的「待唤醒请求积压」条数。
+    ///
+    /// 用来**只告警一次**（不刷屏）：积压条数增加 ⇒ 状态又变了，值得再说一句；
+    /// 条数没变 ⇒ 上一条告警仍然有效，不必重复。
+    last_reported_pending: usize,
+    /// 「投递空转」观测器：运行时在跑但积压条数一直不减少。
+    stuck: bot_bootstrap::StuckWatch,
+    /// 上次报告过的自检错误（同一错误只说一次，避免每 60 秒刷一行）。
+    last_selfcheck_error: Option<String>,
 }
 
 /// 取缓存：命中则零网络，未命中才请求。
@@ -144,7 +161,14 @@ fn cached(
 
 impl Daemon {
     fn new(client: Client) -> Self {
-        Daemon { client, ttl: Ttl::default(), cache: Caches::new() }
+        Daemon {
+            client,
+            ttl: Ttl::default(),
+            cache: Caches::new(),
+            last_reported_pending: 0,
+            stuck: bot_bootstrap::StuckWatch::new(),
+            last_selfcheck_error: None,
+        }
     }
 
     /// 读额度。**读不到就如实报错，绝不返回空数组冒充「额度充足」。**
@@ -354,8 +378,81 @@ impl Daemon {
         // ── 第 0 步：守护 MiniMax Bot 团队（失败绝不拖垮任何东西）──
         // 与 Goal 暂停/恢复互不依赖：bot 挂掉和额度是两回事。
         if cfg.bot_guard.enabled {
-            if let Err(e) = bot_guard::tick(&cfg.bot_guard) {
-                log(&format!("⚠️  Bot 守护本轮出错（不影响其它功能）: {e}"));
+            match bot_guard::tick(&cfg.bot_guard) {
+                Ok((checked, self_healing, needs_user, revived)) => {
+                    if needs_user > 0 || self_healing > 0 {
+                        log(&format!(
+                            "Bot 看门狗：检查 {checked} 个，待人工 {needs_user} 个，可自愈 {self_healing} 个，本轮投递 {revived} 个"
+                        ));
+                    }
+                }
+                Err(e) => log(&format!("⚠️  Bot 守护本轮出错（不影响其它功能）: {e}")),
+            }
+        }
+
+        // ── 第 0.5 步：唤醒链路自检 ──
+        //
+        // 唤醒的执行方是蹬王之王自己的 MiniApp（它有 agentAccess，能起回合）。
+        // 但 MiniApp 是 on-demand 的，**宿主重启后不会自动拉起它** ⇒
+        // 那段时间里「判定」照常写请求、「投递」却没人消费。
+        //
+        // ⚠️ 这里**不做自动修复** —— 2026-10-20 逐条实测过，从宿主外拉起 MiniApp
+        // 的每一条路都堵死（队列写入不被消费 / loopback 凭据只在宿主进程 /
+        // 宿主 HTTP 无此接口 / deeplink 只导航页面 / 官方插件不可改版）。
+        // 详见 `bot_bootstrap.rs` 的完整对照表。
+        //
+        // ⇒ 这里只做**如实告警**：宁可吵，也不能静默地一个 bot 都没叫醒。
+        if cfg.bot_guard.enabled {
+            let pending = bot_guard::pending_request_ids().len();
+            match bot_bootstrap::check(pending) {
+                bot_bootstrap::SelfCheck::NeedsAttention { pending } => {
+                    // 只在「从有到无」的那一刻说一次，避免每分钟刷屏。
+                    if pending > self.last_reported_pending {
+                        log(&format!(
+                            "⚠️  Bot 看门狗：{pending} 个待唤醒请求投不出去 —— 蹬王之王面板的 MiniApp 运行时没在跑（多半是宿主重启后没被拉起）。请打开一次「蹬王之王」面板，它一恢复就会把积压的请求全部补上。"
+                        ));
+                    }
+                    self.last_reported_pending = pending;
+                    // 运行时没起时，「投递空转」是已知原因 ⇒ 观察器复位，不重复报。
+                    self.stuck.observe(0, STUCK_STREAK_ROUNDS);
+                }
+                bot_bootstrap::SelfCheck::Delivering { pending } => {
+                    // 运行时在跑 ⇒ 恢复提示是准确的。
+                    if self.last_reported_pending > 0 {
+                        log("Bot 看门狗：运行时已恢复，积压的唤醒请求正在补上");
+                    }
+                    self.last_reported_pending = 0;
+                    // 接着看「运行时在跑但请求没被消费」的空转情形。
+                    match self.stuck.observe(pending, STUCK_STREAK_ROUNDS) {
+                        bot_bootstrap::StuckEvent::None | bot_bootstrap::StuckEvent::Started => {}
+                        bot_bootstrap::StuckEvent::Recovered => {
+                            log("Bot 看门狗：待唤醒请求的积压条数在变化，唤醒链路已恢复消费");
+                        }
+                        bot_bootstrap::StuckEvent::Stuck { pending, rounds } => {
+                            log(&format!(
+                                "⚠️  Bot 看门狗：运行时在跑，但 {pending} 个待唤醒请求已连续 {rounds} 轮巡检（约 {rounds} 分钟）没被消费 —— 唤醒循环可能已经空转。请打开「蹬王之王」面板看唤醒日志。"
+                            ));
+                        }
+                    }
+                }
+                bot_bootstrap::SelfCheck::Idle => {
+                    // ⚠️ 这里**不能**说「运行时已恢复」——
+                    // pending 归零只说明「没有待办」，不代表运行时起来了。
+                    if self.last_reported_pending > 0 {
+                        log("Bot 看门狗：积压的待唤醒请求已清空");
+                    }
+                    self.last_reported_pending = 0;
+                    self.stuck.observe(0, STUCK_STREAK_ROUNDS);
+                }
+                bot_bootstrap::SelfCheck::Failed(e) => {
+                    // ⚠️ **只说一次**（2026-10-20 独立审计 F3）：
+                    // 自检失败是「判据失效」，可能持续很久
+                    // （比如 lsof 一直报错）⇒ 不去重就是每天 1440 行噪音。
+                    if self.last_selfcheck_error.as_deref() != Some(e.as_str()) {
+                        self.last_selfcheck_error = Some(e.clone());
+                        log(&format!("⚠️  Bot 看门狗自检失败（不影响其它功能）: {e}"));
+                    }
+                }
             }
         }
 

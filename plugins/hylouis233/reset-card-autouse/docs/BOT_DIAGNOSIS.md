@@ -1,7 +1,8 @@
 # Bot 看门狗 · 唤醒通道实测排查手册
 
 > 诊断日期：2026-10-19 首版 / **2026-10-20 重写为「唤醒通道排查手册」** /
-> **2026-10-20 晚间补上 v1.5 的新判据（acked 时间窗、attempts 独立文件、401 自愈）**。
+> **2026-10-20 晚间补上 v1.5 的新判据（acked 时间窗、attempts 独立文件、401 自愈）** /
+> **2026-10-20 夜补上 v1.6：现象 J（读名单失败 ⇒ 整个看门狗静默失效）与现象 K（投递空转）**。
 > 对象：`MiniMax-Code-MiniApps` 里的 `plugins/minimax-ai/minimax-bot`。
 >
 > 这份手册回答一个问题：**「bot 挂掉了，为什么没被叫醒？」**
@@ -197,6 +198,48 @@ sqlite3 ~/.minimax/v2/sqlite/runtime-state.sqlite \
 | 有 bot 带错误码，但日志没提它 | 看 `botGuard.enabled` 是否为 `false`（配置被误抹 ⇒ 看门狗静默失效，无任何报错） |
 | 错误码是 **42212 / 50110 / 50112** | **这是设计如此**：需人工，不自动重试。日志里会有一行「需要你处理」 |
 | 错误码是 **50113 / 50150 / 50151** | 应该出现「因暂时性错误挂掉」那行。没有 ⇒ 判定层被跳过，看 `botGuard.idleMs`（默认 90 秒）是否被调得过大 |
+| **v1.6 补**：日志里**从来没有**「检查 N 个」这行，但 sqlite 里明明有几十个 bot 会话 | 🔴 **判定层根本没进去** —— 读 bot 名单那一步失败了。最常见的原因：minimax-bot 的 `state.json` 里有**被截断的代理对转义**，Rust 的 `serde_json` 严格拒绝 ⇒ `read_bot_sessions()` 返回空 ⇒ 整个看门狗静默失效。v1.6 已用 `parse_lenient_json()` 修；见[现象 J](#现象-j日志里从来没有检查-n-个这行) |
+
+---
+
+### 现象 J：日志里从来没有「检查 N 个」这行
+
+**症状**：守护进程在跑，`sqlite` 里明明有几十个 `purpose='miniapp:minimax-bot'` 的会话，
+但 `/tmp/mcode-reset-card.log` 里**从来没有**「Bot 看门狗：检查 N 个，待人工 M 个，可自愈 K 个」。
+（这条汇总行**只在判定层真的跑起来**时才会出现。）
+
+**查什么**
+
+```bash
+# bot 名单文件在不在、多大
+ls -la ~/.minimax/v2/plugin-data/liveboards/minimax-bot/state.json
+
+# Rust 能不能严格解析它（这正是 v1.6 修的那个 bug）
+python3 - <<'PY'
+import json, pathlib
+p = pathlib.Path.home()/".minimax/v2/plugin-data/liveboards/minimax-bot/state.json"
+raw = p.read_text()
+try:
+    json.loads(raw); print("严格 JSON：OK")
+except Exception as e:
+    print("严格 JSON：失败 ->", e)
+PY
+
+# 找孤立的高代理转义（合法代理对 = \udXXX 后面跟着低代理）
+grep -c $'\\ud[89abAB][0-9a-fA-F][0-9a-fA-F]' ~/.minimax/v2/plugin-data/liveboards/minimax-bot/state.json
+```
+
+**怎么判断**
+
+| 观察到 | 结论 |
+| --- | --- |
+| 严格 JSON 失败，但 Python 报错里提到 `surrogate` / `Unicode` | 🔴 就是这个坑。**v1.6 已修**（`parse_lenient_json()`：只把**孤立的高代理**换成 U+FFFD，合法代理对原样保留）⇒ 升级到 v1.6 |
+| 文件不存在 / 读不到 | 「读不到 ≠ 没有」：守护进程会跳过这一轮，**不会**因此把别的东西判成「有错」 |
+| 严格 JSON 没问题，但日志还是没有汇总行 | 看 `botGuard.enabled`；再看守护进程是不是刚重启还没跑完第一轮（启动后第一轮有几秒延迟） |
+
+**⚠️ 这个坑的教训**：Python 的 `json.loads` 与 Node 的 `JSON.parse` 都能解析，
+**只有 Rust 的 `serde_json` 严格拒绝** ⇒ 跨语言读同一份 JSON，
+**必须让最严格的那个先过**，否则会出现「一边好一边坏」的诡异现象。
 
 ---
 
@@ -467,6 +510,49 @@ MiniApp 被 Host 重启后，它的 loopback 凭据会**换新**；
 > ⚠️ **401 与唤醒是两件事**：401 挡的是**面板**，不是唤醒通道。
 > 唤醒投递方（MiniApp 进程）在 Host 内，用的是自己的凭据 ⇒
 > 面板 401 时**唤醒照样能跑**。别把两件事混在一起排查。
+
+---
+
+### 现象 K：待唤醒请求一直积压，积压条数却从不减少
+
+**查什么**
+
+```bash
+# 1) 积压了多少、积压多久
+python3 - <<'PY'
+import json, time, pathlib
+d = pathlib.Path.home()/".config/mcode-reset-card"
+req = json.loads((d/"bot-revive-requests.json").read_text()).get("requests", [])
+now = int(time.time()*1000)
+for r in req:
+    print(r["id"], "  age(min) =", round((now - r.get("atMs",0))/60000, 1))
+print("总条数:", len(req))
+PY
+
+# 2) 投递方（蹬王之王自己的 MiniApp）活着吗？
+#    判据 = 有活进程 且 cwd 是本插件的运行时包 且包 package.json 的 name == expiry-guardian
+lsof -nP -a -d cwd 2>/dev/null | grep mavis-miniapp
+for d in /private/var/folders/*/*/T/mavis-miniapp-*/package; do
+  printf "%s -> " "$d"; python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['name'])" "$d/package.json" 2>/dev/null || echo "(读不到)"
+done
+
+# 3) 守护进程自己的自检告警
+grep -E "投不出去|没被消费" /tmp/mcode-reset-card.log | tail -10
+```
+
+**怎么判断**
+
+| 观察到 | 结论 | 怎么办 |
+| --- | --- | --- |
+| 没有任何活进程的 cwd 在 `mavis-miniapp-*/package` 下 | 🔴 **投递方没在跑**。多半是**宿主重启后没被拉起**（宿主不会自动拉起任何 MiniApp） | **打开一次「蹬王之王」面板** ⇒ 运行时被拉起 ⇒ 积压的请求会自动全部补上 |
+| 运行时在跑，但守护进程日志出现「已连续 N 轮巡检没被消费」 | 🔴 **投递空转**：唤醒循环可能已经死了 | 打开面板看唤醒日志；重启 MiniApp 运行时 |
+| 运行时在跑，积压条数**在缓慢下降** | ✅ **正常**。一轮唤醒要给每个 bot 起一个 agent 回合，成功一个 ack 一个 ⇒ 条数逐步下降 | 不用管 |
+| 某个请求试满 **3 次** | 该 bot 叫不醒（会话本身有问题）⇒ 请求作废 | 看 `bot-revive-attempts.json` 里该 id 的次数；`bot-revive-acked.json` 里有它说明已被处理过 |
+
+**⚠️ 面板关着 ≠ 唤醒停**（v1.6 实测纠正）：
+运行时 **44 分钟没开面板仍在跑**，唤醒循环照常投递。
+回收机制 `scheduleIdleDrain` 只在 lease 被 release 时才调用，而 lease 只在**回合期间**持有。
+真正的缺口是**宿主重启**。
 
 ---
 

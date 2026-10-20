@@ -22,10 +22,6 @@
   "agentConcurrency": 2,
   "mcpEndpoints": [
     {
-      "server": "minimax-bot",
-      "path": "/mcp/minimax-bot"
-    },
-    {
       "server": "expiry-guardian",
       "path": "/mcp/expiry-guardian"
     }

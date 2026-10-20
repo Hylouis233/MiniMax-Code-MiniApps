@@ -307,11 +307,95 @@ pub struct BotSession {
 /// 读 MiniMax Bot 的 state.json，取出所有 bot → sessionId 映射。
 ///
 /// 结构：`bots[] = {id, name, role}`、`sessions[chatId][botId] = { sessionId }`。
-pub fn read_bot_sessions() -> Vec<BotSession> {
-    let Some(path) = bot_state_path() else { return Vec::new() };
-    let Ok(text) = std::fs::read_to_string(&path) else { return Vec::new() };
-    let Ok(state) = serde_json::from_str::<serde_json::Value>(&text) else { return Vec::new() };
+/// 宽容的 JSON 解析。
+///
+/// ⚠️ 为什么需要（2026-10-20 实测踩到）：
+/// `minimax-bot` 写出的 `state.json` 里出现过**被截断的代理对转义**
+/// （`\ud83d` —— emoji 的高代理，后面的低代理丢了）。
+/// Python 的 `json.loads` 与 Node 的 `JSON.parse` 都能解析它，
+/// 但 Rust 的 `serde_json` **严格拒绝** ⇒
+/// `read_bot_sessions` 直接返回空 ⇒ 整个 Bot 守护静默失效
+/// （而且是「看起来一切正常、实际一个 bot 都没看护」的那种失效）。
+///
+/// ⇒ 这里先尝试严格解析；失败则把**孤立的代理对转义**替换成 U+FFFD 再解析。
+/// 只修这一类明确的坏转义，不做更宽松的猜测。
+fn parse_lenient_json(text: &str) -> Option<serde_json::Value> {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+        return Some(v);
+    }
+    // 找出所有 "\uXXXX" 转义；把**孤立的高代理**（后面不跟低代理）替换掉。
+    //
+    // ⚠️ 区间必须精确（2026-10-20 独立审计 F6）：
+    // - 高代理 = U+D800..=U+DBFF
+    // - 低代理 = U+DC00..=U+DFFF
+    // U+D000..=U+D7FF 是**合法的普通字符**（不是代理），
+    // 早先用「首字母是 d 就当高代理」会把它们也换成 U+FFFD ⇒ 静默改数据。
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    let mut repaired = false;
+    while i < bytes.len() {
+        // 匹配 \uXXXX
+        if bytes[i] == b'\\' && i + 6 <= bytes.len() && bytes[i + 1] == b'u' {
+            let hex = &text[i + 2..i + 6];
+            if let Ok(cp) = u32::from_str_radix(hex, 16) {
+                let is_high = (0xD800..=0xDBFF).contains(&cp);
+                let next_is_low = if is_high && i + 12 <= bytes.len() {
+                    bytes[i + 6] == b'\\'
+                        && bytes[i + 7] == b'u'
+                        && text[i + 8..i + 12]
+                            .chars()
+                            .all(|c| c.is_ascii_hexdigit())
+                        && u32::from_str_radix(&text[i + 8..i + 12], 16)
+                            .map(|c| (0xDC00..=0xDFFF).contains(&c))
+                            .unwrap_or(false)
+                } else {
+                    false
+                };
+                if is_high && !next_is_low {
+                    // 孤立的高代理 ⇒ 坏转义 ⇒ 替换成 U+FFFD。
+                    out.push('\u{FFFD}');
+                    i += 6;
+                    repaired = true;
+                    continue;
+                }
+            }
+        }
+        // 原样拷贝一个 UTF-8 字符
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    if !repaired {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(&out).ok()
+}
 
+pub fn read_bot_sessions() -> Result<Vec<BotSession>, String> {
+    let Some(path) = bot_state_path() else {
+        return Err("取不到 $HOME，找不到状态文件路径".to_string());
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            return Err(format!(
+                "读不到 {}（{e}）",
+                path.display()
+            ))
+        }
+    };
+    let Some(state) = parse_lenient_json(&text) else {
+        return Err(format!(
+            "{} 解析失败（严格 JSON 与容错解析都不行）",
+            path.display()
+        ));
+    };
+    parse_bot_sessions(&state)
+}
+
+/// 从已解析的 state.json 里取出 bot → sessionId 映射。
+fn parse_bot_sessions(state: &serde_json::Value) -> Result<Vec<BotSession>, String> {
     // botId → 名字（MCP 的 message_bot 用**名字**寻址，不是 id）
     let mut names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     if let Some(bots) = state.get("bots").and_then(|b| b.as_array()) {
@@ -343,15 +427,14 @@ pub fn read_bot_sessions() -> Vec<BotSession> {
             }
         }
     }
-    out
+    Ok(out)
 }
 
-/// 写一条「请唤醒这个 bot」的请求。
 /// 判断一条请求是否还「值得投递」。
 ///
 /// 纯函数（不读文件、不读环境变量）⇒ 可以直接单测。
-/// - 已 ack ⇒ 不再投（否则 acked 滚过 200 条后老请求会被二次投递）
-/// - 尝试次数用尽 ⇒ 这个 bot 叫不醒，不再试
+/// - 已 ack ⇒ 不再投（acked 是**永久**的：投递过的就是投递过了）
+/// - 尝试次数用尽 ⇒ 这个 bot 叫不醒，不再试（按 **bot 键**计，跨实例有效）
 /// - 超过最长保留时间 ⇒ 僵尸请求，丢掉
 pub fn is_request_live(
     id: &str,
@@ -363,7 +446,11 @@ pub fn is_request_live(
     if id.is_empty() || acked.contains(id) {
         return false;
     }
-    if attempts.get(id).copied().unwrap_or(0) >= MAX_WAKE_ATTEMPTS {
+    let n = attempts
+        .get(&bot_key_from_request_id(id))
+        .copied()
+        .unwrap_or(0);
+    if n >= MAX_WAKE_ATTEMPTS {
         return false;
     }
     now_ms - at_ms <= MAX_WAKE_REQUEST_AGE_MS
@@ -408,17 +495,23 @@ fn prune_revoke_requests() {
 /// 清理 attempts 文件里的僵尸条目（已 ack 或超龄的）。
 ///
 /// 与 Node 侧 `bumpAttempts` 的清理条件**必须一致**。
+///
+/// ⚠️ v1.6：attempts 的键是 **bot 键**，而 acked 的键是**实例 id**
+/// ⇒ 比较时要把 acked 的 id 折成 bot 键。
 fn prune_attempts(acked: &std::collections::BTreeSet<String>, now: i64) {
     let Some(path) = attempts_path() else { return };
     let Ok(text) = std::fs::read_to_string(&path) else { return };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return };
     let Some(map) = v.get("attempts").and_then(|m| m.as_object()) else { return };
+    let acked_bot_keys: std::collections::BTreeSet<String> = acked
+        .iter()
+        .map(|id| bot_key_from_request_id(id))
+        .collect();
     let kept: serde_json::Map<String, serde_json::Value> = map
         .iter()
         .filter(|(k, val)| {
-            let n = val.get("n").and_then(|x| x.as_i64()).unwrap_or(0);
             let at = val.get("at").and_then(|x| x.as_i64()).unwrap_or(0);
-            let done = acked.contains(k.as_str());
+            let done = acked_bot_keys.contains(k.as_str());
             let too_old = at > 0 && now - at > MAX_WAKE_REQUEST_AGE_MS;
             // 次数用尽但还没超龄的**要保留** —— 它正是「不要再试了」的依据。
             !done && !too_old
@@ -442,7 +535,10 @@ fn prune_attempts(acked: &std::collections::BTreeSet<String>, now: i64) {
 ///
 /// `text` 是**给 bot 看的续跑消息正文**（不是给投递方的指令）——
 /// 投递方会把它原样作为 `agent.run` 的输入。
-pub fn write_revive_request(bot: &BotSession, text: &str) -> Result<(), String> {
+///
+/// `id` 是**实例 id**（`bot-revive:{botId}:{sessionId}:{序号}`）——
+/// 每次写入都是新实例，这样「永久 ack 集」不会把它误杀。
+pub fn write_revive_request(id: &str, bot: &BotSession, text: &str) -> Result<(), String> {
     let path = request_path().ok_or("找不到 $HOME")?;
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -453,10 +549,14 @@ pub fn write_revive_request(bot: &BotSession, text: &str) -> Result<(), String> 
         .and_then(|v| v.get("requests").and_then(|r| r.as_array()).cloned())
         .unwrap_or_default();
 
-    let id = format!("bot-revive:{}:{}", bot.bot_id, bot.session_id);
     // ⚠️ attempts 不再内嵌在这条请求里（它单独存一个文件，见 `attempts_path`），
     // 否则本守护进程与投递端并发写同一个文件会互相覆盖。
-    requests.retain(|r| r.get("id").and_then(|v| v.as_str()) != Some(id.as_str()));
+    // 只清掉**同一个 bot 键**的旧实例（同一个 bot 不该同时挂两条待办）。
+    let bot_key = format!("bot-revive:{}:{}", bot.bot_id, bot.session_id);
+    requests.retain(|r| {
+        let rid = r.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        bot_key_from_request_id(rid) != bot_key
+    });
     // 丢掉「叫不醒」的请求（尝试次数用尽）与僵尸请求（超过最长保留时间）。
     // ⚠️ **不能只按时间清理** —— 面板关着时没人消费，纯时间清理会让请求
     // 在面板重新打开之前就全部过期作废（2026-10-20 实测）。
@@ -473,7 +573,11 @@ pub fn write_revive_request(bot: &BotSession, text: &str) -> Result<(), String> 
         if acked.contains(id) {
             return false;
         }
-        let n = attempts.get(id).copied().unwrap_or(0);
+        // ⚠️ 尝试次数按 **bot 键**记（跨实例有效，否则 3 次封顶会被架空）。
+        let n = attempts
+            .get(&bot_key_from_request_id(id))
+            .copied()
+            .unwrap_or(0);
         n < MAX_WAKE_ATTEMPTS && now - at <= MAX_WAKE_REQUEST_AGE_MS
     });
     requests.push(json!({
@@ -502,12 +606,21 @@ pub fn write_revive_request(bot: &BotSession, text: &str) -> Result<(), String> 
 /// 已被投递方（minimax-bot 的 MiniApp）确认处理的请求 id。
 /// 「最近被救过」的请求 id 及其时间戳。
 ///
-/// ⚠️ **为什么带时间戳、还要有窗口**（2026-10-20 独立审计发现）：
+/// ⚠️ **为什么带时间戳**（2026-10-20 独立审计发现）：
 /// 原来 acked 是个纯 id 列表 ⇒ 「救过一次」变成**永久黑名单**。
 /// 实测：6 个 bot 明明又坏了（闲置 47~94 分钟，远超 90 秒阈值），
 /// 却因为 acked 里有过它们而永远不再被叫醒。
-/// ⇒ 改成「最近 30 分钟内救过就不再重复救；超过窗口可以再救」。
-/// 「最近被救过」的请求 id → 被救的时间戳（毫秒）。
+/// ⇒ 时间戳保留下来。
+///
+/// ⚠️ **v1.6 改掉了「窗口」的用法**（2026-10-20 独立审计 + 实测发现）：
+/// 原来这个 30 分钟窗口**同时**承担两个职责：
+/// 「这条投递过了吗」与「这个 bot 多久可以再救一次」。
+/// ⇒ 窗口一过，**已经投递过的请求又变回「未处理」** ⇒
+/// 投递端**每 30 分钟把同一条请求重投一次**（每个回合 ≈47k tokens），
+/// 而且会打断已经恢复正常的 bot。
+/// ⇒ 现在两个职责**分开**：
+/// - 「投递过了吗」⇒ **永久**（见 `acked_ids`）；
+/// - 「多久可以再救一次」⇒ **守护进程自己的频率限制**（见 `acked_recent_bot_keys`）。
 ///
 /// 兼容两种格式：
 /// - 新格式 `{"acked": {"<id>": <ms>}}`
@@ -540,24 +653,52 @@ pub fn acked_map() -> std::collections::BTreeMap<String, i64> {
     out
 }
 
-/// 只返回「最近被救过、且还在抑制窗口内」的请求 id。
+/// 所有「已被投递方确认处理」的请求 id —— **永久**，不看时间窗。
 ///
-/// ⚠️ 窗口的作用（2026-10-20 独立审计发现）：纯 id 列表会让「救过一次」
-/// 变成**永久黑名单** —— 实测 6 个又坏了的 bot 因此永远不再被叫醒。
-/// ⇒ 抑制只持续 `ACK_SUPPRESS_WINDOW_MS`；超过窗口就可以再救。
+/// ⚠️ v1.6 改判据（2026-10-20 独立审计 + 实测）：
+/// 原来带 30 分钟窗口 ⇒ 窗口一过，**已经投递过的请求又变回「未处理」**
+/// ⇒ 投递端**每 30 分钟把同一条请求重投一次**（每回合 ≈47k tokens），
+/// 还会打断已经恢复正常的 bot。
+/// ⇒ 现在：**投递过的就是投递过了**。
+/// 「多久可以再救同一个 bot」改由守护进程自己的频率限制管
+/// （`acked_recent_bot_keys`）——那是**写请求**时的判断，不是**投递**时的判断。
 pub fn acked_ids() -> std::collections::BTreeSet<String> {
+    acked_map().into_keys().collect()
+}
+
+/// 最近 `window_ms` 毫秒内被成功救过的 **bot 键**（守护进程的频率限制用）。
+///
+/// bot 键 = `bot-revive:{botId}:{sessionId}`（不含实例序号），
+/// 也就是「这个 bot 最近有没有被救过」。
+pub fn acked_recent_bot_keys(window_ms: i64) -> std::collections::BTreeSet<String> {
     let now = crate::api::now_ms();
     acked_map()
         .into_iter()
-        .filter(|(_, at)| *at > 0 && now - *at <= ACK_SUPPRESS_WINDOW_MS)
-        .map(|(id, _)| id)
+        .filter(|(_, at)| *at > 0 && now - *at <= window_ms)
+        .map(|(id, _)| bot_key_from_request_id(&id))
         .collect()
 }
 
-/// 「救过一次」的抑制窗口（毫秒）。
+/// 从请求 id 推出 **bot 键**（= `bot-revive:{botId}:{sessionId}`，不含实例序号）。
 ///
-/// 30 分钟：既能避免同一轮里重复投递（60 秒巡检间隔下会重复 30 次），
+/// 请求 id 的形状：`bot-revive:{botId}:{sessionId}[:{实例序号}]`。
+/// ⇒ 取前三段。**Rust 与 Node 必须用同一个算法** —— 它是「尝试次数」的键。
+pub fn bot_key_from_request_id(id: &str) -> String {
+    let parts: Vec<&str> = id.split(':').collect();
+    if parts.len() >= 3 {
+        format!("{}:{}:{}", parts[0], parts[1], parts[2])
+    } else {
+        id.to_string()
+    }
+}
+
+/// 「救过一次」的抑制窗口（毫秒）—— **只用于「多久可以再救一次」**。
+///
+/// 30 分钟：既能避免刚救完就又救（同一轮里重复投递），
 /// 又不会让「救过一次」变成永久黑名单。
+///
+/// ⚠️ v1.6：它**不再**参与「这条请求投递过没有」的判断
+/// （那是 `acked_ids()` 的事，永久）。
 pub const ACK_SUPPRESS_WINDOW_MS: i64 = 30 * 60 * 1000;
 
 /// 还没被处理的请求 id（供诊断与避免重复投递）。
@@ -579,7 +720,9 @@ pub fn pending_request_ids() -> std::collections::BTreeSet<String> {
                         return None;
                     }
                     // 尝试次数用尽 ⇒ 这个 bot 叫不醒 ⇒ 不再重试。
-                    let attempts = attempts.get(&id).copied().unwrap_or(0);
+                    // ⚠️ 尝试次数按 **bot 键**记（不是实例 id）——
+                    // 否则每换一个实例就重置计数，3 次封顶会被架空。
+                    let attempts = attempts.get(&bot_key_from_request_id(&id)).copied().unwrap_or(0);
                     if attempts >= MAX_WAKE_ATTEMPTS {
                         return None;
                     }
@@ -594,22 +737,63 @@ pub fn pending_request_ids() -> std::collections::BTreeSet<String> {
         .unwrap_or_default()
 }
 
+/// 这个 bot 是否已经有一条**活的**待办请求。
+///
+/// ⚠️ v1.6：请求 id 按实例唯一化了 ⇒ 不能用 id 直接比，
+/// 要用 **bot 键**（id 的前 3 段）比。
+fn has_live_request_for_bot(bot_key: &str) -> bool {
+    let Some(path) = request_path() else { return false };
+    let Ok(text) = std::fs::read_to_string(&path) else { return false };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return false };
+    let Some(list) = v.get("requests").and_then(|r| r.as_array()) else { return false };
+    let acked = acked_ids();
+    let attempts = attempts_map();
+    let now = crate::api::now_ms();
+    list.iter().any(|r| {
+        let id = r.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if bot_key_from_request_id(id) != bot_key {
+            return false;
+        }
+        let at = r.get("atMs").and_then(|a| a.as_i64()).unwrap_or(0);
+        if acked.contains(id) {
+            return false;
+        }
+        let n = attempts.get(bot_key).copied().unwrap_or(0);
+        n < MAX_WAKE_ATTEMPTS && now - at <= MAX_WAKE_REQUEST_AGE_MS
+    })
+}
+
 /// 给 bot 写一条唤醒请求。
 ///
-/// 返回 `Ok(false)` 表示这个 bot 的请求已经在待办里（不用重复写）。
+/// 返回 `Ok(false)` 表示**这次不用写**（已有活的待办 / 叫不醒 / 刚救过）。
+///
+/// ⚠️ **v1.6：请求 id 按「实例」唯一化**（2026-10-20 独立审计 + 实测）。
+/// 原因：`acked` 改成永久之后（见 `acked_ids`），**同一个 id 会被永久压制**，
+/// 于是「bot 又坏了要能再救」这条路就断了。
+/// ⇒ id = `bot-revive:{botId}:{sessionId}:{实例序号}`，每次写入都是新实例。
+/// ⇒ 而「尝试次数」按 **bot 键**（前 3 段）记 ⇒ 3 次封顶跨实例有效。
 pub fn enqueue_revive_request(bot: &BotSession, text: &str) -> Result<bool, String> {
-    let id = format!("bot-revive:{}:{}", bot.bot_id, bot.session_id);
-    if pending_request_ids().contains(&id) {
+    let bot_key = format!("bot-revive:{}:{}", bot.bot_id, bot.session_id);
+    // ① 这个 bot 已经有一条**活的**待办 ⇒ 不重复写。
+    if has_live_request_for_bot(&bot_key) {
         return Ok(false);
     }
-    // ⚠️ 尝试次数已用尽 ⇒ 这个 bot 叫不醒 ⇒ **不要重写请求**。
+    // ② 尝试次数已用尽 ⇒ 这个 bot 叫不醒 ⇒ **不要重写请求**。
     // 否则每轮都会把 atMs 刷新一次（让请求看起来还"新鲜"），
     // 而投递端又因为 attempts 用尽而永不处理 ⇒ 纯粹的无用写入。
     let attempts = attempts_map();
-    if attempts.get(&id).copied().unwrap_or(0) >= MAX_WAKE_ATTEMPTS {
+    if attempts.get(&bot_key).copied().unwrap_or(0) >= MAX_WAKE_ATTEMPTS {
         return Ok(false);
     }
-    write_revive_request(bot, text)?;
+    // ③ 频率限制：最近 `ACK_SUPPRESS_WINDOW_MS` 内已经成功救过这个 bot
+    //    ⇒ 别急着再救（既省钱，也别打断刚恢复的 bot）。
+    //    ⚠️ 这是**写请求时**的判断；「投递过没有」是另一回事（`acked_ids`，永久）。
+    if acked_recent_bot_keys(ACK_SUPPRESS_WINDOW_MS).contains(&bot_key) {
+        return Ok(false);
+    }
+    // ④ 写一条**新实例**的请求（id 唯一 ⇒ 不会被永久 ack 集误杀）。
+    let instance_id = format!("{}:{}", bot_key, crate::api::now_ms());
+    write_revive_request(&instance_id, bot, text)?;
     Ok(true)
 }
 
@@ -692,10 +876,24 @@ const REVIVE_MESSAGE: &str = "【看门狗】上一个回合因内部错误中�
 ///
 /// 返回 (检查数, 可自愈数, 需人工数, 已投递数)。
 pub fn tick(cfg: &crate::config::BotGuardCfg) -> Result<(usize, usize, usize, usize), String> {
-    let bots = read_bot_sessions();
+    // ⚠️ **v1.6：读不到名单必须说出来**（2026-10-20 独立审计 F1）。
+    // 原来这里是 `if bots.is_empty() { return Ok((0,0,0,0)) }` ——
+    // **一个字都不打**。于是「名单读不出来」这件事在日志里完全不可见，
+    // 守护进程看起来一切正常，实际**一个 bot 都没看护**。
+    // 这正是本轮 `parse_lenient_json` 修掉的那个历史故障的「告警的洞」：
+    // 修的是因，告警的洞没堵。
+    let bots = match read_bot_sessions() {
+        Ok(b) => b,
+        Err(e) => {
+            report_list_problem(&format!("读不到 bot 名单（{e}）"));
+            return Ok((0, 0, 0, 0));
+        }
+    };
     if bots.is_empty() {
+        report_list_problem("bot 名单是空的");
         return Ok((0, 0, 0, 0));
     }
+    clear_list_problem();
     // 每轮先清理一次请求文件：已 ack 的、尝试次数用尽的、超过 24 小时的都清掉。
     // ⚠️ 必须每轮做（2026-10-20 独立审计发现）：只在「写新请求时」清理的话，
     // acked 列表滚过 200 条后，那些老请求会重新变成「未处理」⇒ 被二次投递。
@@ -705,47 +903,78 @@ pub fn tick(cfg: &crate::config::BotGuardCfg) -> Result<(usize, usize, usize, us
     let mut self_healing = 0usize;
     let mut needs_user = 0usize;
     let mut revived = 0usize;
-    let acked = acked_ids();
     // 同一轮里已经在待办里的 id，避免每 60 秒重复写同一个 bot。
-    let pending = pending_request_ids();
+    // ⚠️ v1.6：**按 bot 键比**（请求 id 现在带实例后缀，不能直接比 id）。
+    let pending_bot_keys: std::collections::BTreeSet<String> = pending_request_ids()
+        .iter()
+        .map(|id| bot_key_from_request_id(id))
+        .collect();
     // 「需要你处理」的去重：同一个 bot 的同一个错误，只提示一次。
     // 2026-10-19 实测：不加这个，日志每分钟刷 9 行同样的内容（40 分钟 463 行）。
     let mut notified = notified_errors();
 
     for bot in &bots {
-        let Some((status, code, message, last_activity)) = states.get(&bot.session_id) else {
+        let Some(st) = states.get(&bot.session_id) else {
             continue;
         };
-        // 已经恢复活动 ⇒ 撤销待办，不打扰它。
-        if !is_idle(*last_activity, now, cfg.idle_ms) {
+        // ── ① **最新回合是权威判据**（2026-10-20 实测，v1.6）──
+        //
+        // 会话上的 `error_code` 是**陈旧值**（运行时不清它）。
+        // 实测：15:39 那一轮写了 11 条唤醒请求，其中 **8 条是误判** ——
+        // 那 8 个 bot 的**最新回合其实是 completed**（它好着呢），
+        // error_code 是更早那次失败留下的陈值。
+        // ⇒ 判「这个 bot 现在坏没坏」必须看**最新回合**：
+        //   - `failed`   ⇒ 真失败 ⇒ 该救
+        //   - `aborted`  ⇒ 被中断 ⇒ 该救
+        //   - `completed`⇒ 上一轮成功 ⇒ 别碰
+        //   - `accepted` ⇒ 正在跑 ⇒ 别碰（这同时覆盖了「20 多分钟的长回合」）
+        //   - 没有回合记录 ⇒ 回退到老判据（error_code + 闲置）
+        let really_broken = match st.turn_status.as_deref() {
+            Some("failed") | Some("aborted") => true,
+            // `completed` = 上一轮成功；`accepted` = 正在跑；
+            // 其它未知状态 ⇒ 保守地**不碰**（看不懂就别打断人家）。
+            Some(_) => false,
+            None => !is_idle(st.last_activity, now, cfg.idle_ms),
+        };
+        if !really_broken {
             continue;
         }
-        let (verdict, _reason) = classify_error(*code, message);
+        // ── ② 还在动 ⇒ 不打扰（长回合保护；也给刚失败的回合留一点冷却时间）──
+        if !is_idle(st.last_activity, now, cfg.idle_ms) {
+            continue;
+        }
+        let (verdict, _reason) = classify_error(st.error_code, &st.error_message);
         match verdict {
             Verdict::Healthy => continue,
             Verdict::NeedsUser => {
                 needs_user += 1;
                 // 去重键：bot + 错误码 + 错误文案。错误一变就是新问题，值得再提示。
-                let key = format!("{}|{}|{}", bot.bot_id, code, message);
+                let key = format!("{}|{}|{}", bot.bot_id, st.error_code, st.error_message);
                 if notified.insert(key) {
                     crate::log(&format!(
                         "Bot 看门狗：{} 需要你处理（{}）—— 不自动重试",
-                        bot.bot_name, message
+                        bot.bot_name, st.error_message
                     ));
                 }
                 continue;
             }
             Verdict::SelfHealing => {
-                // 已经在待办里 ⇒ 不重复投递
-                let id = format!("bot-revive:{}:{}", bot.bot_id, bot.session_id);
-                if acked.contains(&id) || pending.contains(&id) {
+                // 已经有**活的**待办 ⇒ 不重复投递。
+                //
+                // ⚠️ v1.6：这里**不能**再用 `acked.contains(bot_key)` 挡人。
+                // acked 现在是**永久**的「投递过的请求」集合，而旧格式的 ack id
+                // 恰好**等于** bot 键 ⇒ 那个判断会把「曾经被救过的 bot」
+                // 永久挡死（实测：两个真坏的 bot 30 分钟内一次都没被叫醒）。
+                // 「多久可以再救一次」由 `enqueue_revive_request` 里的频率限制管。
+                let bot_key = format!("bot-revive:{}:{}", bot.bot_id, bot.session_id);
+                if pending_bot_keys.contains(&bot_key) {
                     continue;
                 }
                 // ⚠️ 尝试次数已用尽 ⇒ 这个 bot 叫不醒 ⇒ **完全静默**。
                 // 否则每 60 秒都会打一行「已写入唤醒请求」，而投递端因为
                 // attempts 用尽根本不会处理 ⇒ 纯噪音，还把 24 小时兜底架空
                 // （atMs 每次被刷新，永远不过期）。
-                let attempts_used = attempts_map().get(&id).copied().unwrap_or(0);
+                let attempts_used = attempts_map().get(&bot_key).copied().unwrap_or(0);
                 if attempts_used >= MAX_WAKE_ATTEMPTS {
                     continue;
                 }
@@ -756,7 +985,7 @@ pub fn tick(cfg: &crate::config::BotGuardCfg) -> Result<(usize, usize, usize, us
                         revived += 1;
                         crate::log(&format!(
                             "Bot 看门狗：{} 因暂时性错误（{}）挂掉，已写入唤醒请求（由本插件的 MiniApp 投递）",
-                            bot.bot_name, message
+                            bot.bot_name, st.error_message
                         ));
                     }
                     Ok(false) => {
@@ -774,13 +1003,58 @@ pub fn tick(cfg: &crate::config::BotGuardCfg) -> Result<(usize, usize, usize, us
     Ok((bots.len(), self_healing, needs_user, revived))
 }
 
-/// 读一批会话的当前状态：status / error_code / error_message / 最后活动时间。
+/// 上次报告过的「名单读不出来」的原因（用于去重，避免每 60 秒刷一行）。
+static LAST_LIST_PROBLEM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// 报告「读不到 bot 名单」——**同一个原因只说一次**，换原因了才再说。
+fn report_list_problem(detail: &str) {
+    let Ok(mut guard) = LAST_LIST_PROBLEM.lock() else { return };
+    if guard.as_deref() == Some(detail) {
+        return;
+    }
+    *guard = Some(detail.to_string());
+    crate::log(&format!(
+        "⚠️  Bot 看门狗：{detail} —— 本轮**没有看护任何 bot**（守护进程在跑，但它是瞎的）"
+    ));
+}
+
+/// 名单恢复正常 ⇒ 撤销去重标记（下次再坏还会再说一次）。
+fn clear_list_problem() {
+    if let Ok(mut guard) = LAST_LIST_PROBLEM.lock() {
+        if guard.take().is_some() {
+            crate::log("Bot 看门狗：bot 名单已恢复正常");
+        }
+    }
+}
+
+/// 一个 bot 会话的当前状态。
+struct SessionState {
+    /// 会话状态（`idle` / `started` / `error` …）。
+    #[allow(dead_code)]
+    status: String,
+    /// 会话上的错误码 —— ⚠️ 可能是**陈旧值**（运行时不清它）。
+    error_code: i64,
+    /// 错误文案。
+    error_message: String,
+    /// 最后活动时间（`local_runtime_message_rows` 里最近一条消息的时间）。
+    last_activity: i64,
+    /// **最新回合**的状态：`accepted`（正在跑）/ `completed`（成功）/
+    /// `failed`（失败）/ `aborted`（被中断）/ `None`（没有回合记录）。
+    ///
+    /// ⚠️ 这是判「这个 bot 现在坏没坏」的**权威依据**（2026-10-20 实测）。
+    turn_status: Option<String>,
+}
+
+/// 读一批会话的当前状态：status / error_code / error_message / 最后活动时间 / 最新回合状态。
 ///
 /// 最后活动时间取 `local_runtime_message_rows` 里该会话最近一条消息的时间 ——
 /// 这是「这个会话现在还在动吗」的权威依据。
+///
+/// 最新回合取 `local_runtime_turn_ingress` 里该会话 `accepted_at_ms` 最大的那条 ——
+/// 这是「这个 bot 现在坏没坏」的权威依据（见 `SessionState::turn_status`）。
 fn read_session_states(
     bots: &[BotSession],
-) -> Result<std::collections::HashMap<String, (String, i64, String, i64)>, String> {
+) -> Result<std::collections::HashMap<String, SessionState>, String> {
     let mut out = std::collections::HashMap::new();
     if bots.is_empty() {
         return Ok(out);
@@ -795,7 +1069,10 @@ fn read_session_states(
         "SELECT s.session_id AS sid, s.status AS status,\n\
          IFNULL(s.error_code, 0) AS error_code, IFNULL(s.error_message, '') AS error_message,\n\
          IFNULL((SELECT MAX(m.created_at_ms) FROM local_runtime_message_rows m\n\
-                 WHERE m.session_id = s.session_id), 0) AS last_activity\n\
+                 WHERE m.session_id = s.session_id), 0) AS last_activity,\n\
+         (SELECT t.status FROM local_runtime_turn_ingress t\n\
+           WHERE t.session_id = s.session_id\n\
+           ORDER BY t.accepted_at_ms DESC LIMIT 1) AS turn_status\n\
          FROM local_runtime_sessions s WHERE s.session_id IN ({ids});"
     );
     let raw = crate::goal_sync::exec_sql(&db, &sql)?;
@@ -807,12 +1084,20 @@ fn read_session_states(
         let Some(sid) = r.get("sid").and_then(|v| v.as_str()) else { continue };
         out.insert(
             sid.to_string(),
-            (
-                r.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                r.get("error_code").and_then(|v| v.as_i64()).unwrap_or(0),
-                r.get("error_message").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                r.get("last_activity").and_then(|v| v.as_i64()).unwrap_or(0),
-            ),
+            SessionState {
+                status: r.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                error_code: r.get("error_code").and_then(|v| v.as_i64()).unwrap_or(0),
+                error_message: r
+                    .get("error_message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                last_activity: r.get("last_activity").and_then(|v| v.as_i64()).unwrap_or(0),
+                turn_status: r
+                    .get("turn_status")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+            },
         );
     }
     Ok(out)
@@ -829,6 +1114,87 @@ fn runtime_db_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── 解析器（v1.6 补回归测试：之前这个函数零覆盖）──
+
+    #[test]
+    fn lenient_parse_keeps_valid_surrogate_pairs() {
+        // 合法代理对（😀 = U+1F600）必须**原样保留**。
+        let v = parse_lenient_json(r#"{"a":"\ud83d\ude00"}"#).expect("应能解析");
+        assert_eq!(v["a"].as_str(), Some("\u{1F600}"));
+    }
+
+    #[test]
+    fn lenient_parse_replaces_isolated_high_surrogate() {
+        // 截断的高代理（低代理丢了）⇒ 替换成 U+FFFD。
+        let v = parse_lenient_json(r#"{"a":"x\ud83dy"}"#).expect("应能解析");
+        assert_eq!(v["a"].as_str(), Some("x\u{FFFD}y"));
+    }
+
+    #[test]
+    fn lenient_parse_keeps_d000_range_characters() {
+        // ⚠️ U+D000..=U+D7FF 是**合法普通字符**，不是代理 ⇒ 不能被替换。
+        let v = parse_lenient_json(r#"{"a":"\ud7b0"}"#).expect("应能解析");
+        assert_eq!(v["a"].as_str(), Some("\u{D7B0}"));
+    }
+
+    #[test]
+    fn lenient_parse_does_not_repair_unrelated_broken_json() {
+        // 与代理无关的坏 JSON ⇒ 不许「修」⇒ 返回 None（调用方据此报「解析失败」）。
+        assert!(parse_lenient_json(r#"{"a":1,}"#).is_none());
+        assert!(parse_lenient_json("not json at all").is_none());
+    }
+
+    #[test]
+    fn lenient_parse_handles_high_followed_by_high() {
+        // 高+高不是合法代理对 ⇒ 第一个高代理是孤立的 ⇒ 替换。
+        let v = parse_lenient_json(r#"{"a":"\ud83d\ud83d"}"#).expect("应能解析");
+        assert_eq!(v["a"].as_str(), Some("\u{FFFD}\u{FFFD}"));
+    }
+
+    // ── bot 键（v1.6：请求 id 按实例唯一化）──
+
+    #[test]
+    fn bot_key_strips_instance_suffix() {
+        assert_eq!(
+            bot_key_from_request_id("bot-revive:bot1:mvs_abc:1792481946906"),
+            "bot-revive:bot1:mvs_abc"
+        );
+        // 旧格式（没有实例后缀）也要折成同一个键。
+        assert_eq!(
+            bot_key_from_request_id("bot-revive:bot1:mvs_abc"),
+            "bot-revive:bot1:mvs_abc"
+        );
+        // 形状不对 ⇒ 原样返回（不能瞎折）。
+        assert_eq!(bot_key_from_request_id("weird"), "weird");
+    }
+
+    #[test]
+    fn attempts_are_counted_per_bot_not_per_instance() {
+        // 同一个 bot 的不同实例 ⇒ 共享同一份尝试次数（否则 3 次封顶被架空）。
+        let now = crate::api::now_ms();
+        let acked = std::collections::BTreeSet::new();
+        let mut attempts = std::collections::BTreeMap::new();
+        attempts.insert("bot-revive:b1:mvs_x".to_string(), MAX_WAKE_ATTEMPTS);
+        // 新实例 id 折出的 bot 键同样被封顶挡住。
+        assert!(
+            !is_request_live("bot-revive:b1:mvs_x:111", now, now, &acked, &attempts),
+            "换实例也不该绕过 3 次封顶"
+        );
+    }
+
+    #[test]
+    fn acked_request_is_never_delivered_again() {
+        // ⚠️ v1.6：acked 是**永久**的 —— 「投递过了就是投递过了」。
+        let now = crate::api::now_ms();
+        let mut acked = std::collections::BTreeSet::new();
+        acked.insert("bot-revive:b1:mvs_x:111".to_string());
+        let attempts = std::collections::BTreeMap::new();
+        assert!(
+            !is_request_live("bot-revive:b1:mvs_x:111", now, now, &acked, &attempts),
+            "已投递的请求不该再投"
+        );
+    }
 
     #[test]
     fn needs_user_errors_are_not_retried() {
