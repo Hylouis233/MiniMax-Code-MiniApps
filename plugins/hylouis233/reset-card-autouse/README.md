@@ -34,8 +34,12 @@ actually watched or woken"** — and fix three real bugs found in production.
 | **`miniapp publish` fixed** | The manifest's MCP endpoint set did not match the host's in-memory "published snapshot". Declare **exactly one** endpoint (`server=expiry-guardian`, `path=/mcp/expiry-guardian`) + the matching `servers.mcp.json` + `"mcpServers": ["servers.mcp.json"]` in `plugin.json` ⇒ publish succeeds (verified twice) |
 | **Several "says something false" branches fixed** | A cleared backlog no longer claims "the runtime recovered"; a *growing* backlog no longer claims "delivery resumed" (only a *shrinking* one does); a failing `lsof` is reported as "the check is broken", not "the runtime is down"; a repeated self-check failure is logged once; surrogate ranges are matched exactly (U+D000–D7FF are ordinary characters, not surrogates) |
 
-Tests: Rust **70/70**, Python **20/20**, MiniApp **118/118**
-(bot_wakeup 41 + config-fidelity 15 + decision 58 + retry.behavior 4).
+| 11 | 🔴 **A typo in the dashboard's data layer broke the whole panel** | `doBuildSnapshot()` wrote `platform` as `platformRes` ⇒ `ReferenceError` ⇒ **`buildSnapshot()` throws outright** ⇒ quota, decision, reset cards and credits all unavailable ⇒ **the panel was broken**. The typo was introduced in **v1.2** (`fd98d98`) and survived four releases. It went unnoticed because the unit tests cover the pure `decide()` function — **the data layer itself was never executed** |
+| 12 | 🔴 **The `watchdog_status` MCP tool always returned `{}`** | `deps.status()` is `async`, but the handler never awaited it ⇒ it got a **Promise** ⇒ `JSON.stringify(Promise)` is the string `"{}"`. (`watchdog_wake` and `watchdog_decide` *are* awaited — only `status` was missed.) |
+| 13 | ✅ **Two regression tests added** (both bugs survived purely because nothing covered them) | `mcp.test.mjs` (18 checks): MCP protocol, the three tools, **an `async` status must really be awaited** (otherwise it is `"{}"`), and an unknown tool must fail loudly. `server-lint.test.mjs` (5 checks): a static guard for "used but never declared" identifiers — reintroducing the typo makes it fail (5/5 → 3/5) |
+
+Tests: Rust **70/70**, Python **20/20**, MiniApp **136/136**
+(bot_wakeup 41 + config-fidelity 15 + decision 58 + mcp 18 + server-lint 5 + retry.behavior 4).
 
 ### v1.5 — architecture hardening (2026-10-20, evening)
 

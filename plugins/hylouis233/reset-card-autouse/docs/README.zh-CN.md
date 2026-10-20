@@ -73,9 +73,12 @@
 | 8 | 🔧 **纠正文档里的一个错误结论** | 此前写「面板关着时唤醒不会发生」——**不准确**。实测运行时 44 分钟没开面板仍在跑，唤醒循环照常投递。真正的缺口是**宿主重启** |
 | 9 | 🔧 **`miniapp publish` 修复** | 根因是 manifest 声明的 MCP 端点集与 Host 内存里的「已发布快照」对不上。**只声明 1 个端点** + 相应 `servers.mcp.json` + `plugin.json` 的 `"mcpServers": ["servers.mcp.json"]` ⇒ 发布成功（已实测两次） |
 | 10 | 🔧 **修掉几处会「说假话」/误报的分支** | 积压归零时不再说「运行时已恢复」（只说「积压已清空」）；积压**变多**时不再说「已恢复消费」（只有**变少**才算恢复）；lsof 报错时判「判据失效」而不是「运行时没起」；自检失败同一个错误只说一次；代理对区间判错（U+D000–D7FF 是合法字符，不是代理） |
+| 11 | 🔴 **修掉看板取数层的一个拼写错误** | `doBuildSnapshot()` 里把 `platform` 写成 `platformRes` ⇒ `ReferenceError` ⇒ **`buildSnapshot()` 整个抛异常** ⇒ 额度、决策、重置卡、积分**全拿不到** ⇒ **整个面板是坏的**。这个 typo 是 **v1.2 引入的**（`fd98d98`），活了 4 个版本才被发现。实测：修前 MCP 工具返回 `quotaError: "platformRes is not defined"`，修后 `quotaError: null`，额度/决策/卡片全部正常 |
+| 12 | 🔴 **修掉 MCP 工具永远返回 `{}`** | `deps.status()` 是 `async`，handler 里**漏了 `await`** ⇒ 拿到的是 Promise ⇒ `JSON.stringify(Promise)` = 字符串 `"{}"` ⇒ `watchdog_status` 什么也看不到（`watchdog_wake` / `watchdog_decide` 都有 await，只有它漏了） |
+| 13 | ✅ **补两个回归测试**（这两个 bug 都是零覆盖才活下来的） | `mcp.test.mjs`（18 项）：MCP 协议、三个工具、**async 的 status 必须真的 await**、未知工具要报明确的错。`server-lint.test.mjs`（5 项）：静态守卫「用了但没声明的标识符」—— 把 typo 放回去实测能抓住（5/5 → 3/5） |
 
-测试：Rust **70/70**、Python **20/20**、MiniApp **118/118**
-（bot_wakeup 41 + config-fidelity 15 + decision 58 + retry.behavior 4）。
+测试：Rust **70/70**、Python **20/20**、MiniApp **136/136**
+（bot_wakeup 41 + config-fidelity 15 + decision 58 + mcp 18 + server-lint 5 + retry.behavior 4）。
 
 ### v1.5 更新内容
 
@@ -875,7 +878,7 @@ Bot 会话超过 idleMs 没动静
 
 ---
 
-## 踩过的坑（二十四个都写在这里了）
+## 踩过的坑（二十六个都写在这里了）
 
 1. **Rust `format!` 不替换裸花括号** ⇒ `WHERE goal_id='{goal_id}'` 是字面量 ⇒ UPDATE 影响 0 行却退出码 0 ⇒ **假成功**。
    ⇒ 凡靠 UPDATE 改状态的判据，**必须回读校验**。「命令执行成功」≠「改到了行」。
@@ -1045,6 +1048,23 @@ Bot 会话超过 idleMs 没动静
     ⇒ 附带一条：**改了键的粒度，所有用到这个键的比较都要跟着改** ——
     实测「永久 ack 集」和「旧格式的 bot 键」字符串完全相同，
     一行 `acked.contains(&bot_key)` 就把两个真坏的 bot 永久挡死了。
+
+25. **🔴 一个拼写错误把整个面板搞挂了 4 个版本**（2026-10-20 实测，v1.6 修复）——
+    `doBuildSnapshot()` 里 `platform` 写成 `platformRes` ⇒ `ReferenceError`
+    ⇒ `buildSnapshot()` 整个抛异常 ⇒ 额度/决策/重置卡/积分**全拿不到**。
+    ⇒ 为什么没人发现：单测测的是**纯函数** `decide()`，
+    **取数那层（`doBuildSnapshot`）从来没被跑过**。
+    ⇒ 教训：**单测覆盖了「算法」，不等于覆盖了「接线」**。
+    ⇒ 补法：① 静态守卫（`server-lint.test.mjs`）抓「用了但没声明的标识符」；
+    ② 用 MCP 工具当**线上金丝雀**——`quotaError` 非空就说明取数层炸了。
+
+26. **🔴 `async` 的依赖漏了 `await` ⇒ 工具永远返回 `{}`**（2026-10-20 实测，v1.6 修复）——
+    MCP handler 里 `JSON.stringify(deps.status(), null, 2)`，
+    而 `deps.status` 是 `async` ⇒ 拿到的是 **Promise** ⇒
+    `JSON.stringify(Promise)` = 字符串 `"{}"`。
+    ⇒ 工具「成功返回」，但内容永远是空的 —— 比直接报错更难发现。
+    ⇒ 教训：**同一段代码里 await 了一处、漏了另一处，肉眼几乎看不出来**；
+    必须有一条测试专门盯「返回值不是空」。
 
 ### 查运行时问题的入口
 
