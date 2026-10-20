@@ -13,7 +13,7 @@
  *   node verify-parity.mjs           # 比对三者
  *   node verify-parity.mjs --write   # 顺便刷新快照
  */
-import { readFileSync, writeFileSync, existsSync, mkdtempSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdtempSync, mkdirSync, copyFileSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -31,7 +31,12 @@ const WORKSPACE_MINIAPP = join(
   WORKSPACE, 'miniapps', 'expiry-guardian', 'miniapp', 'node', 'server.mjs',
 );
 const MINIAPP_SERVER = existsSync(PLUGIN_MINIAPP) ? PLUGIN_MINIAPP : WORKSPACE_MINIAPP;
-const BG_PY = join(HERE, 'reset_card_autouse.py');
+// ⚠️ **必须支持 `MCODE_BG_SCRIPT` 覆盖**（2026-10-20 实测发现）：
+// `check-parity.sh` 的第 3 步是「校验器自检」——它把后台脚本改成一份**注入漂移**的
+// 副本，再跑校验器，要求校验器**必须报不一致**（否则说明校验器自己已经失效了）。
+// 而这里原本把路径**写死**了 ⇒ 校验器永远读的是原脚本 ⇒ 永远报一致
+// ⇒ 自检**从建立起就一直是坏的**（一直在报「校验器本身已失效」）。
+const BG_PY = process.env.MCODE_BG_SCRIPT || join(HERE, 'reset_card_autouse.py');
 const RUST_DAEMON = join(HERE, 'rust', 'target', 'release', 'reset-card-daemon');
 const SNAPSHOT = join(HERE, 'bg_parity.json');
 
@@ -71,9 +76,26 @@ process.env.HOME = TMP_HOME;
 
 // ── 1. Mini App ──────────────────────────────────────────────────────────────
 const src = readFileSync(MINIAPP_SERVER, 'utf8').replace(/export async function start[\s\S]*$/, '');
-const mod = await import(
-  'data:text/javascript;base64,' + Buffer.from(src + '\nexport { decide };').toString('base64')
-);
+// ⚠️ 不能用 data: URL 导入 —— Mini App 的 server.mjs 现在有相对 import
+//    （./bot_wakeup.mjs、./mcp.mjs），data: URL 里解析不了相对路径
+//    （ERR_UNSUPPORTED_RESOLVE_REQUEST）。
+// ⇒ 改成把 server.mjs 复制成一份「只保留导出前部分」的临时 .mjs 文件再 import。
+//
+// ⚠️ **必须把同目录的兄弟模块一起复制过去**（2026-10-20 实测踩到）：
+// 原来只复制了 `bot_wakeup.mjs`，而 server.mjs 后来又 import 了 `./mcp.mjs`
+// ⇒ ERR_MODULE_NOT_FOUND ⇒ **这道三方一致性校验一直在报错、根本没在跑**
+// （文档里「一致性是测出来的，不是声称的」就成了空话）。
+// ⇒ 改成：把 MiniApp 目录下的**所有 .mjs** 都复制过去，server.mjs 再 import 哪个都找得到。
+const modDir = mkdtempSync(join(tmpdir(), 'expiry-parity-'));
+const modFile = join(modDir, 'server-under-test.mjs');
+writeFileSync(modFile, src + '\nexport { decide };');
+// 依赖文件跟 server.mjs 同目录（server.mjs 用相对路径 import 它们）。
+for (const f of readdirSync(dirname(MINIAPP_SERVER))) {
+  if (f.endsWith('.mjs') && f !== 'server.mjs') {
+    copyFileSync(join(dirname(MINIAPP_SERVER), f), join(modDir, f));
+  }
+}
+const mod = await import(modFile);
 const miniDecide = mod.decide;
 
 // ── 2. Python ────────────────────────────────────────────────────────────────
