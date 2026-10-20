@@ -215,6 +215,54 @@ console.log('\n=== v1.6：bot 键的推导规则必须与 Rust 侧逐字一致 =
   check('形状不对 ⇒ 原样返回（不瞎折）', mod.botKeyFromRequestId('weird') === 'weird');
 }
 
+console.log('\n=== v1.6 二轮审计 F1：失败计数不能被「曾被救过」清掉 ===');
+// 回归：acked 永久化之后，「按 acked 清理 attempts」会把**曾经被救过**的 bot
+// 的失败计数一起清掉 ⇒ 3 次封顶失效 ⇒ 该请求永远「活」⇒ 每 60 秒重投一次。
+{
+  const home5 = mkdtempSync(join(tmpdir(), 'expiry-wake-'));
+  const d5 = join(home5, '.config', 'mcode-reset-card');
+  mkdirSync(d5, { recursive: true });
+  // 这个 bot 曾经被救过（acked 里有它）。
+  writeFileSync(
+    join(d5, 'bot-revive-acked.json'),
+    JSON.stringify({ acked: [{ id: 'bot-revive:b1:mvs_1:111', atMs: Date.now() }] }),
+  );
+  // 已经有 2 次失败记录（bot 键）。
+  writeFileSync(
+    join(d5, 'bot-revive-attempts.json'),
+    JSON.stringify({ attempts: { 'bot-revive:b1:mvs_1': { n: 2, at: Date.now() } } }),
+  );
+  const prevHome5 = process.env.HOME;
+  process.env.HOME = home5;
+  // 再失败一次 ⇒ 计数必须是 3，而不是被清成 0/1。
+  await mod.bumpAttempts('bot-revive:b1:mvs_1');
+  const map = JSON.parse(readFileSync(join(d5, 'bot-revive-attempts.json'), 'utf8')).attempts ?? {};
+  check(
+    '失败计数累加到 3（没被 acked 清掉）',
+    map['bot-revive:b1:mvs_1']?.n === 3,
+    JSON.stringify(map['bot-revive:b1:mvs_1']),
+  );
+  check('计数表没被清空', Object.keys(map).length >= 1, `剩 ${Object.keys(map).length} 条`);
+  process.env.HOME = prevHome5;
+}
+
+console.log('\n=== v1.6：投递成功时失败计数归零 ===');
+{
+  const home6 = mkdtempSync(join(tmpdir(), 'expiry-wake-'));
+  const d6 = join(home6, '.config', 'mcode-reset-card');
+  mkdirSync(d6, { recursive: true });
+  writeFileSync(
+    join(d6, 'bot-revive-attempts.json'),
+    JSON.stringify({ attempts: { 'bot-revive:b1:mvs_1': { n: 2, at: Date.now() } } }),
+  );
+  const prevHome6 = process.env.HOME;
+  process.env.HOME = home6;
+  await mod.clearAttemptsOnSuccess('bot-revive:b1:mvs_1');
+  const map = JSON.parse(readFileSync(join(d6, 'bot-revive-attempts.json'), 'utf8')).attempts ?? {};
+  check('成功后失败计数归零', !('bot-revive:b1:mvs_1' in map), JSON.stringify(map));
+  process.env.HOME = prevHome6;
+}
+
 console.log('\n=== 尝试次数单独存一个文件（不与守护进程抢同一个文件）===');
 // 2026-10-20 审计发现：投递端与守护进程会并发写 requests 文件。
 // 若投递端做「读全量 → 改字段 → 写回全量」，会把守护进程刚写进去的条目抹掉。

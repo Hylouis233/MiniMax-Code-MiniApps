@@ -228,15 +228,20 @@ export async function bumpAttempts(id) {
   // 而「已 ack」的条目本来就该清（它已经处理完了）；
   // 「超龄」也该清（僵尸记录）。其余一律保留。
   const nowMs = Date.now();
-  const acked = readAckedMap();
-  // ⚠️ attempts 的键是 **bot 键**，而 acked 的键是**实例 id** ⇒ 比较时折成 bot 键。
-  const ackedBotKeys = new Set([...acked.keys()].map((k) => botKeyFromRequestId(k)));
+  // ⚠️ **v1.6 修正：清理条件里不能有「已 ack」**（2026-10-20 二轮独立审计 F1）。
+  //
+  // 原来这里有 `done = acked.has(k)`（键 = bot 键）。而 v1.6 把 acked 改成**永久**之后，
+  // 它的含义从「刚刚被救过」变成了「**曾经**被救过」
+  // ⇒ 一个被救过的 bot，它的**失败计数**会在**同一次 bumpAttempts 调用里**被清掉
+  // ⇒ **3 次封顶彻底失效** ⇒ 该请求永远「活」⇒ 每 60 秒重投一次
+  // ⇒ 每轮烧一个 agent 回合（≈47k~93k tokens）。
+  //
+  // ⇒ 失败计数**只在成功时清**（见 `clearAttemptsOnSuccess`），这里只按**超龄**清理。
   const kept = {};
   for (const [k, v] of Object.entries(map)) {
-    const done = ackedBotKeys.has(k);
     const at = v && typeof v === 'object' ? Number(v.at ?? 0) : 0;
     const tooOld = at > 0 && nowMs - at > MAX_ATTEMPT_AGE_MS;
-    if (!done && !tooOld) kept[k] = v;
+    if (!tooOld) kept[k] = v;
   }
   const entries = Object.entries(kept);
   const trimmed = entries.length > MAX_ATTEMPT_ENTRIES ? entries.slice(-MAX_ATTEMPT_ENTRIES) : entries;
@@ -246,7 +251,38 @@ export async function bumpAttempts(id) {
   await rename(tmp, file);
 }
 
-/** 读出所有已尝试次数（键 = 请求 id）。 */
+/**
+ * 投递**成功**时清掉这个 bot 的失败计数。
+ *
+ * ⚠️ 为什么必须在「成功」时清，而不是在「失败时按 acked 清理」
+ *   （2026-10-20 二轮独立审计 F1）：acked 现在是**永久**的
+ *   ⇒ 「按 acked 清理」会把「**曾经**被救过」的 bot 的失败计数也清掉
+ *   ⇒ 3 次封顶失效 ⇒ 无限重投。
+ * ⇒ 失败计数的语义是「这个 bot 最近连续投递失败了几次」，
+ *   **成功一次就该归零** —— 只在这里归零。
+ *
+ * @param {string} botKey
+ */
+export async function clearAttemptsOnSuccess(botKey) {
+  const key = String(botKey ?? '');
+  if (!key) return;
+  const file = attemptsFile();
+  let parsed;
+  try {
+    parsed = JSON.parse(await readFile(file, 'utf8'));
+  } catch {
+    return; // 文件不存在 ⇒ 没有失败计数要清
+  }
+  const map = parsed?.attempts && typeof parsed.attempts === 'object' ? parsed.attempts : {};
+  if (!(key in map)) return;
+  delete map[key];
+  await mkdir(dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.tmp`;
+  await writeFile(tmp, `${JSON.stringify({ attempts: map }, null, 2)}\n`, 'utf8');
+  await rename(tmp, file);
+}
+
+/** 读出所有已尝试次数（键 = bot 键）。 */
 export function readAttemptsMap() {
   try {
     const v = JSON.parse(readFileSync(attemptsFile(), 'utf8'));
@@ -465,6 +501,8 @@ async function runRound(agent) {
         // 一轮要几分钟（每个 bot 一个 agent 回合），而巡检间隔只有 60 秒。
         // 不立刻 ack 的话，下一轮会读到同一批未 ack 的请求 ⇒ 重复唤醒 + 双倍 token。
         await appendAcked([req.id]);
+        // 成功一次 ⇒ 这个 bot 的失败计数归零（见 clearAttemptsOnSuccess 的说明）。
+        await clearAttemptsOnSuccess(botKeyFromRequestId(req.id));
       } else {
         await bumpAttempts(botKeyFromRequestId(req.id));
         failed.push({ id: req.id, detail: `唤醒回合未成功：${errText || r?.status || '未知'}` });

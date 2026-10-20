@@ -330,6 +330,13 @@ fn parse_lenient_json(text: &str) -> Option<serde_json::Value> {
     // - 低代理 = U+DC00..=U+DFFF
     // U+D000..=U+D7FF 是**合法的普通字符**（不是代理），
     // 早先用「首字母是 d 就当高代理」会把它们也换成 U+FFFD ⇒ 静默改数据。
+    //
+    // ⚠️ **必须按字节解析，不能切 `&str`**（2026-10-20 二轮独立审计 F2）：
+    // `&text[i+2..i+6]` 在 `i` 落在多字节字符中间时会 **panic**
+    // （"end byte index 12 is not a char boundary"）
+    // ⇒ 守护进程整个崩掉（launchd 重启后同样崩 ⇒ 崩溃循环）。
+    // 触发条件：文件严格 JSON 解析失败 **且** 文件里出现 `\u` + 非 ASCII 字符
+    //（生产 `state.json` 里有 89.5 万个非 ASCII 字符，用户发一条含 `\u` 的文本即命中）。
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
     let mut i = 0usize;
@@ -337,16 +344,12 @@ fn parse_lenient_json(text: &str) -> Option<serde_json::Value> {
     while i < bytes.len() {
         // 匹配 \uXXXX
         if bytes[i] == b'\\' && i + 6 <= bytes.len() && bytes[i + 1] == b'u' {
-            let hex = &text[i + 2..i + 6];
-            if let Ok(cp) = u32::from_str_radix(hex, 16) {
+            if let Some(cp) = hex4(bytes, i + 2) {
                 let is_high = (0xD800..=0xDBFF).contains(&cp);
                 let next_is_low = if is_high && i + 12 <= bytes.len() {
                     bytes[i + 6] == b'\\'
                         && bytes[i + 7] == b'u'
-                        && text[i + 8..i + 12]
-                            .chars()
-                            .all(|c| c.is_ascii_hexdigit())
-                        && u32::from_str_radix(&text[i + 8..i + 12], 16)
+                        && hex4(bytes, i + 8)
                             .map(|c| (0xDC00..=0xDFFF).contains(&c))
                             .unwrap_or(false)
                 } else {
@@ -361,15 +364,39 @@ fn parse_lenient_json(text: &str) -> Option<serde_json::Value> {
                 }
             }
         }
-        // 原样拷贝一个 UTF-8 字符
-        let ch = text[i..].chars().next().unwrap();
-        out.push(ch);
-        i += ch.len_utf8();
+        // 原样拷贝一个 UTF-8 字符（`i` 一定在字符边界上：正常字符按 len_utf8 前进，
+        // 坏转义是 6 个 ASCII 字节）。
+        match text.get(i..) {
+            Some(rest) => {
+                let ch = rest.chars().next().unwrap_or('\u{FFFD}');
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+            None => break,
+        }
     }
     if !repaired {
         return None;
     }
     serde_json::from_str::<serde_json::Value>(&out).ok()
+}
+
+/// 读 4 个十六进制字节成一个 u32（**纯字节，不切 str** ⇒ 不会 panic）。
+fn hex4(bytes: &[u8], at: usize) -> Option<u32> {
+    if at + 4 > bytes.len() {
+        return None;
+    }
+    let mut v: u32 = 0;
+    for &b in &bytes[at..at + 4] {
+        let d = match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            b'A'..=b'F' => b - b'A' + 10,
+            _ => return None,
+        };
+        v = v * 16 + d as u32;
+    }
+    Some(v)
 }
 
 pub fn read_bot_sessions() -> Result<Vec<BotSession>, String> {
@@ -481,7 +508,7 @@ fn prune_revoke_requests() {
     // ⚠️ 清理条件**必须**是「已 ack」或「超龄」——
     // 不能按「requests 文件里还在不在」清：Rust 的 prune 会删掉「次数用尽」的请求，
     // 连带清掉 attempts 记录 ⇒ 3 次封顶被架空 ⇒ 无限重试（2026-10-20 独立审计发现）。
-    prune_attempts(&acked, now);
+    prune_attempts(now);
     if kept.len() == list.len() {
         return; // 没变化就别写（避免无谓的磁盘写）
     }
@@ -496,25 +523,31 @@ fn prune_revoke_requests() {
 ///
 /// 与 Node 侧 `bumpAttempts` 的清理条件**必须一致**。
 ///
-/// ⚠️ v1.6：attempts 的键是 **bot 键**，而 acked 的键是**实例 id**
-/// ⇒ 比较时要把 acked 的 id 折成 bot 键。
-fn prune_attempts(acked: &std::collections::BTreeSet<String>, now: i64) {
+/// ⚠️ **v1.6 修正：清理条件里不能有「已 ack」**（2026-10-20 二轮独立审计 F1）。
+/// 原来清理条件含 `acked.contains(bot_key)`，而 v1.6 把 acked 改成**永久**之后，
+/// 它的含义从「刚刚被救过」变成了「**曾经**被救过」
+/// ⇒ 一个被救过的 bot，它的**失败计数**会被清掉
+/// ⇒ **3 次封顶彻底失效** ⇒ 该请求永远「活」⇒ 每 60 秒重投一次
+/// ⇒ 每轮烧一个 agent 回合（≈47k~93k tokens）。
+/// （Node 侧 `bumpAttempts` 同构复现：第 1 次失败后 attempts 直接变 undefined。）
+///
+/// ⇒ 失败计数**只在成功时清**（见 Node 侧 `clearAttemptsOnSuccess`），
+/// 这里只按**超龄**清理。
+fn prune_attempts(now: i64) {
     let Some(path) = attempts_path() else { return };
     let Ok(text) = std::fs::read_to_string(&path) else { return };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return };
     let Some(map) = v.get("attempts").and_then(|m| m.as_object()) else { return };
-    let acked_bot_keys: std::collections::BTreeSet<String> = acked
-        .iter()
-        .map(|id| bot_key_from_request_id(id))
-        .collect();
     let kept: serde_json::Map<String, serde_json::Value> = map
         .iter()
-        .filter(|(k, val)| {
+        .filter(|(_k, val)| {
             let at = val.get("at").and_then(|x| x.as_i64()).unwrap_or(0);
-            let done = acked_bot_keys.contains(k.as_str());
             let too_old = at > 0 && now - at > MAX_WAKE_REQUEST_AGE_MS;
-            // 次数用尽但还没超龄的**要保留** —— 它正是「不要再试了」的依据。
-            !done && !too_old
+            // ⚠️ **只按超龄清**。次数用尽但还没超龄的**要保留** ——
+            // 它正是「不要再试了」的依据。
+            // ⚠️ 也不能按「已 ack」清：acked 现在是永久的（见上面的说明），
+            // 那会把失败计数一起清掉 ⇒ 3 次封顶失效。
+            !too_old
         })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
@@ -848,6 +881,52 @@ pub fn is_idle(last_activity_ms: i64, now_ms: i64, idle_ms: i64) -> bool {
     now_ms - last_activity_ms >= idle_ms
 }
 
+/// 判定一个 bot 会话「现在是不是真的坏了」——**纯函数**，可直接单测。
+///
+/// 判据是**最新回合**（不是会话上那个会变陈的 `error_code`）：
+///
+/// | 最新回合 | 结论 | 理由 |
+/// | --- | --- | --- |
+/// | `failed` | **坏了** | 真失败 |
+/// | `aborted` | **坏了** | 被中断 |
+/// | `completed` | 好了 | 上一轮成功 |
+/// | `accepted` | 还在跑 ⇒ 好了；**但**超过 `STUCK_ACCEPTED_AFTER_MS` ⇒ **坏了** | 宿主崩溃留下的僵尸回合永远停在 `accepted` |
+/// | 没有记录 | **交给下游判定** | 见下面的说明 |
+/// | 其它未知值 | 好了 | 看不懂就别打断人家 |
+///
+/// ⚠️ **「没有回合记录」必须返回 `true`**（2026-10-20 二轮独立审计 F3）：
+/// 原来这里写的是 `!is_idle(...)`，而调用方紧接着还有一道
+/// `if !is_idle(...) { continue; }` —— 两处互为否定
+/// ⇒ 「没有回合记录」的会话**永远走不到救援**，注释承诺的「回退老判据」从未生效。
+/// ⇒ 现在返回 true，把「坏没坏」交给调用方的 `classify_error` + `is_idle` 双重判定。
+///
+/// ⚠️ 调用方那道 `is_idle` 闸**必须对所有分支生效** —— 它既是「没有回合记录」时的
+/// 回退判据，也是「刚失败别急着救」的冷却期。
+pub fn judge_broken(
+    turn_status: Option<&str>,
+    turn_accepted_at: i64,
+    last_activity: i64,
+    now: i64,
+    idle_ms: i64,
+) -> bool {
+    match turn_status {
+        Some("failed") | Some("aborted") => true,
+        Some("completed") => false,
+        Some("accepted") => {
+            // 正在跑 ⇒ 别碰；但「接受」太久（宿主崩溃留下的僵尸）⇒ 该救。
+            let age = now - turn_accepted_at;
+            age > 0 && age > STUCK_ACCEPTED_AFTER_MS
+        }
+        Some(_) => false,
+        None => {
+            // 没有回合记录 ⇒ 交给下游的 classify_error + is_idle 判定。
+            // ⚠️ 这里**不能**再用 `!is_idle(...)`（见上面的说明）。
+            let _ = (last_activity, now, idle_ms);
+            true
+        }
+    }
+}
+
 /// 唤醒 bot 时发送的续跑消息正文。
 const REVIVE_MESSAGE: &str = "【看门狗】上一个回合因内部错误中断，本条是自动重新启用的续跑消息。\n请从中断处继续，不要重做已完成的部分。";
 
@@ -923,23 +1002,20 @@ pub fn tick(cfg: &crate::config::BotGuardCfg) -> Result<(usize, usize, usize, us
         // 实测：15:39 那一轮写了 11 条唤醒请求，其中 **8 条是误判** ——
         // 那 8 个 bot 的**最新回合其实是 completed**（它好着呢），
         // error_code 是更早那次失败留下的陈值。
-        // ⇒ 判「这个 bot 现在坏没坏」必须看**最新回合**：
-        //   - `failed`   ⇒ 真失败 ⇒ 该救
-        //   - `aborted`  ⇒ 被中断 ⇒ 该救
-        //   - `completed`⇒ 上一轮成功 ⇒ 别碰
-        //   - `accepted` ⇒ 正在跑 ⇒ 别碰（这同时覆盖了「20 多分钟的长回合」）
-        //   - 没有回合记录 ⇒ 回退到老判据（error_code + 闲置）
-        let really_broken = match st.turn_status.as_deref() {
-            Some("failed") | Some("aborted") => true,
-            // `completed` = 上一轮成功；`accepted` = 正在跑；
-            // 其它未知状态 ⇒ 保守地**不碰**（看不懂就别打断人家）。
-            Some(_) => false,
-            None => !is_idle(st.last_activity, now, cfg.idle_ms),
-        };
+        let really_broken = judge_broken(
+            st.turn_status.as_deref(),
+            st.turn_accepted_at,
+            st.last_activity,
+            now,
+            cfg.idle_ms,
+        );
         if !really_broken {
             continue;
         }
         // ── ② 还在动 ⇒ 不打扰（长回合保护；也给刚失败的回合留一点冷却时间）──
+        //
+        // ⚠️ 这道闸**对所有分支生效**：它既是「没有回合记录」时的回退判据，
+        // 也是「刚失败别急着救」的冷却期。
         if !is_idle(st.last_activity, now, cfg.idle_ms) {
             continue;
         }
@@ -1043,7 +1119,16 @@ struct SessionState {
     ///
     /// ⚠️ 这是判「这个 bot 现在坏没坏」的**权威依据**（2026-10-20 实测）。
     turn_status: Option<String>,
+    /// 最新回合被「接受」的时间（毫秒）—— 用来判断 `accepted` 是不是僵尸回合。
+    turn_accepted_at: i64,
 }
+
+/// 回合停在 `accepted` 超过这么久 ⇒ 视为**僵尸回合**（宿主崩溃/被杀留下的）。
+///
+/// ⚠️ 取 **1 小时**：`accepted` 既可能是「正在跑」，也可能是「宿主崩了留下的僵尸」。
+/// 正常的长回合实测能跑 20 多分钟 ⇒ 阈值必须比它大。
+/// 1 小时既能覆盖长回合，又能保证僵尸回合不会**永远**不被救。
+pub const STUCK_ACCEPTED_AFTER_MS: i64 = 60 * 60 * 1000;
 
 /// 读一批会话的当前状态：status / error_code / error_message / 最后活动时间 / 最新回合状态。
 ///
@@ -1072,7 +1157,10 @@ fn read_session_states(
                  WHERE m.session_id = s.session_id), 0) AS last_activity,\n\
          (SELECT t.status FROM local_runtime_turn_ingress t\n\
            WHERE t.session_id = s.session_id\n\
-           ORDER BY t.accepted_at_ms DESC LIMIT 1) AS turn_status\n\
+           ORDER BY t.accepted_at_ms DESC LIMIT 1) AS turn_status,\n\
+         IFNULL((SELECT t.accepted_at_ms FROM local_runtime_turn_ingress t\n\
+           WHERE t.session_id = s.session_id\n\
+           ORDER BY t.accepted_at_ms DESC LIMIT 1), 0) AS turn_accepted_at\n\
          FROM local_runtime_sessions s WHERE s.session_id IN ({ids});"
     );
     let raw = crate::goal_sync::exec_sql(&db, &sql)?;
@@ -1097,6 +1185,7 @@ fn read_session_states(
                     .get("turn_status")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string()),
+                turn_accepted_at: r.get("turn_accepted_at").and_then(|v| v.as_i64()).unwrap_or(0),
             },
         );
     }
@@ -1194,6 +1283,118 @@ mod tests {
             !is_request_live("bot-revive:b1:mvs_x:111", now, now, &acked, &attempts),
             "已投递的请求不该再投"
         );
+    }
+
+    // ── 二轮审计 F1：失败计数不能被「曾被救过」清掉 ──
+
+    #[test]
+    fn attempts_survive_a_bot_that_was_acked_before() {
+        // ⚠️ v1.6 回归（2026-10-20 二轮独立审计 F1）：
+        // acked 永久化之后，「按 acked 清理 attempts」会把**曾经被救过**的 bot
+        // 的失败计数一起清掉 ⇒ 3 次封顶失效 ⇒ 无限重投。
+        // ⇒ 清理条件里**不能**有 acked。
+        let dir = std::env::temp_dir().join(format!("expiry-attempts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let attempts_file = dir.join("bot-revive-attempts.json");
+        std::fs::write(
+            &attempts_file,
+            r#"{"attempts":{"bot-revive:b1:mvs_x":{"n":2,"at":1792480000000}}}"#,
+        )
+        .unwrap();
+        // 把路径指向临时目录（attempts_path 读的是 $HOME）。
+        let prev_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", &dir) };
+        // 此刻 HOME 下的路径是 $HOME/.config/mcode-reset-card/...，
+        // 上面写错了位置 ⇒ 改成正确布局再测。
+        let real = dir.join(".config").join("mcode-reset-card");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(
+            real.join("bot-revive-attempts.json"),
+            r#"{"attempts":{"bot-revive:b1:mvs_x":{"n":2,"at":1792480000000}}}"#,
+        )
+        .unwrap();
+        // 造一个「这个 bot 曾被救过」的 ack 记录。
+        std::fs::write(
+            real.join("bot-revive-acked.json"),
+            r#"{"acked":[{"id":"bot-revive:b1:mvs_x:111","atMs":1792480000000}]}"#,
+        )
+        .unwrap();
+
+        // 跑清理（只按超龄清）⇒ 失败计数必须**留着**。
+        prune_attempts(crate::api::now_ms());
+        let after = std::fs::read_to_string(real.join("bot-revive-attempts.json")).unwrap();
+        assert!(
+            after.contains("bot-revive:b1:mvs_x"),
+            "被救过的 bot 的失败计数不能被清掉（否则 3 次封顶失效）：{after}"
+        );
+
+        if let Some(h) = prev_home {
+            unsafe { std::env::set_var("HOME", h) };
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 二轮审计 F2：解析器不能 panic ──
+
+    #[test]
+    fn lenient_parse_does_not_panic_on_multibyte_after_backslash_u() {
+        // ⚠️ 原来的写法按字节切 `&str` ⇒ 落在多字节字符中间会 **panic**
+        // ⇒ 守护进程整个崩掉（launchd 重启后同样崩 ⇒ 崩溃循环）。
+        // 触发条件：文件严格 JSON 解析失败 **且** 含 `\u` + 非 ASCII 字符。
+        for raw in [
+            r#"{"a":"\u中中"}"#,
+            r#"{"a":"x\uy中"}"#,
+            r#"{"a":"\u"}"#,
+            r#"{"a":"\u12"}"#,
+            r#"{"a":"\u12中4"}"#,
+        ] {
+            // 关键：不能 panic。
+            let _ = parse_lenient_json(raw);
+        }
+    }
+
+    // ── 二轮审计 F3 / F4：判定层的三个边界 ──
+
+    #[test]
+    fn no_turn_record_is_rescuable() {
+        // ⚠️ 原来 `None => !is_idle(...)` 与调用方的 `is_idle` 闸互为否定
+        // ⇒ 「没有回合记录」的会话永远走不到救援。
+        assert!(
+            judge_broken(None, 0, 0, 1_000_000, 90_000),
+            "没有回合记录时必须交给下游判定，不能直接判「没坏」"
+        );
+    }
+
+    #[test]
+    fn fresh_accepted_turn_is_left_alone_but_zombie_is_rescued() {
+        let now = 1_000_000_000i64;
+        // 刚开始的回合（正在跑）⇒ 别碰。
+        assert!(!judge_broken(Some("accepted"), now - 1_000, 0, now, 90_000));
+        // 跑了 20 分钟的长回合 ⇒ 仍别碰（实测长回合能跑 20+ 分钟）。
+        assert!(!judge_broken(
+            Some("accepted"),
+            now - 20 * 60 * 1000,
+            0,
+            now,
+            90_000
+        ));
+        // 僵尸回合（宿主崩溃留下，停了 2 小时）⇒ 该救。
+        assert!(judge_broken(
+            Some("accepted"),
+            now - 2 * 60 * 60 * 1000,
+            0,
+            now,
+            90_000
+        ));
+    }
+
+    #[test]
+    fn failed_and_completed_are_unambiguous() {
+        let now = 1_000_000_000i64;
+        assert!(judge_broken(Some("failed"), 0, 0, now, 90_000));
+        assert!(judge_broken(Some("aborted"), 0, 0, now, 90_000));
+        assert!(!judge_broken(Some("completed"), 0, 0, now, 90_000));
     }
 
     #[test]

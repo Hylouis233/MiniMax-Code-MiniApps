@@ -79,10 +79,16 @@ pub enum SelfCheck {
 ///
 /// 组合起来（活进程 + 目录归属）才是可靠判据。
 pub fn runtime_alive() -> Result<bool, String> {
-    // `lsof -a -d cwd` 列出**所有活进程**的工作目录。
+    // `lsof -a -d cwd -F` 列出**所有活进程**的工作目录。
     // 只列活进程 ⇒ 「目录还在但进程没了」这种假阳性被排除。
+    //
+    // ⚠️ 用 `-F`（字段模式）而不是默认的定宽表格（2026-10-20 二轮独立审计 F5）：
+    // 默认模式下路径是最后一列，**路径含空格就会被切碎**
+    // ⇒ `ends_with("/package")` 恒假 ⇒ 每轮都误判「运行时没起」
+    // ⇒ 每轮都催用户去开一个已经开着的面板。
+    // `-F` 模式下路径是 `n` 字段的**整行剩余部分**，空格保留 ✓。
     let out = std::process::Command::new("lsof")
-        .args(["-nP", "-a", "-d", "cwd"])
+        .args(["-nP", "-a", "-d", "cwd", "-F"])
         .output()
         .map_err(|e| format!("无法执行 lsof（判据失效，不当成「没起」）：{e}"))?;
     // ⚠️ **stderr 非空 ⇒ 判据失效，不是「没起」**（2026-10-20 独立审计 F3）。
@@ -98,13 +104,21 @@ pub fn runtime_alive() -> Result<bool, String> {
         ));
     }
     let text = String::from_utf8_lossy(&out.stdout);
+    // 字段模式：一个进程一段，`f<fd>` 标明接下来的 `n<name>` 属于哪个 fd。
+    let mut fd_is_cwd = false;
     for line in text.lines() {
-        // lsof 的 cwd 行最后一列就是路径（我们的 TMPDIR 路径不含空格）。
-        let Some(cwd) = line.split_whitespace().last() else { continue };
-        if !cwd.contains(MINIAPP_PACKAGE_MARKER) || !cwd.ends_with("/package") {
+        if let Some(fd) = line.strip_prefix('f') {
+            fd_is_cwd = fd == "cwd";
             continue;
         }
-        if package_is_ours(cwd) {
+        let Some(name) = line.strip_prefix('n') else { continue };
+        if !fd_is_cwd {
+            continue;
+        }
+        if name.contains(MINIAPP_PACKAGE_MARKER)
+            && name.ends_with("/package")
+            && package_is_ours(name)
+        {
             return Ok(true);
         }
     }

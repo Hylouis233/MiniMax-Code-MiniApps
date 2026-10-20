@@ -377,8 +377,24 @@ impl Daemon {
 
         // ── 第 0 步：守护 MiniMax Bot 团队（失败绝不拖垮任何东西）──
         // 与 Goal 暂停/恢复互不依赖：bot 挂掉和额度是两回事。
+        //
+        // ⚠️ **catch_unwind 兜底**（2026-10-20 二轮独立审计 F2）：
+        // 这一层要读用户聊天记录（`state.json`，几 MB），什么奇怪的字节都可能进来。
+        // 一个 panic 会带走**整个守护进程**（额度判定、Goal 唤醒、bot 看门狗一起死），
+        // 而 launchd 重启后同样崩 ⇒ 崩溃循环。
+        // ⇒ 这里兜住：panic 只影响 bot 看门狗这一件事，其它功能照常。
         if cfg.bot_guard.enabled {
-            match bot_guard::tick(&cfg.bot_guard) {
+            let guard = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                bot_guard::tick(&cfg.bot_guard)
+            }));
+            let result = match guard {
+                Ok(r) => r,
+                Err(_) => {
+                    log("⚠️  Bot 守护本轮 panic（已兜住，不影响额度判定与 Goal 唤醒）");
+                    Ok((0, 0, 0, 0))
+                }
+            };
+            match result {
                 Ok((checked, self_healing, needs_user, revived)) => {
                     if needs_user > 0 || self_healing > 0 {
                         log(&format!(
@@ -426,7 +442,10 @@ impl Daemon {
                     match self.stuck.observe(pending, STUCK_STREAK_ROUNDS) {
                         bot_bootstrap::StuckEvent::None | bot_bootstrap::StuckEvent::Started => {}
                         bot_bootstrap::StuckEvent::Recovered => {
-                            log("Bot 看门狗：待唤醒请求的积压条数在变化，唤醒链路已恢复消费");
+                            // ⚠️ 别说过头（2026-10-20 二轮独立审计 F6）：
+                            // 积压减少也可能是「请求超龄被清掉」，**不一定**是消费端恢复。
+                            // ⇒ 只说事实：积压在减少。
+                            log("Bot 看门狗：待唤醒请求的积压条数在减少（此前报告的投递空转可能已解除）");
                         }
                         bot_bootstrap::StuckEvent::Stuck { pending, rounds } => {
                             log(&format!(

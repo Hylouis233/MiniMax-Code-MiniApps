@@ -38,8 +38,14 @@ actually watched or woken"** — and fix three real bugs found in production.
 | 12 | 🔴 **The `watchdog_status` MCP tool always returned `{}`** | `deps.status()` is `async`, but the handler never awaited it ⇒ it got a **Promise** ⇒ `JSON.stringify(Promise)` is the string `"{}"`. (`watchdog_wake` and `watchdog_decide` *are* awaited — only `status` was missed.) |
 | 13 | ✅ **Two regression tests added** (both bugs survived purely because nothing covered them) | `mcp.test.mjs` (18 checks): MCP protocol, the three tools, **an `async` status must really be awaited** (otherwise it is `"{}"`), and an unknown tool must fail loudly. `server-lint.test.mjs` (5 checks): a static guard for "used but never declared" identifiers — reintroducing the typo makes it fail (5/5 → 3/5) |
 
-Tests: Rust **70/70**, Python **20/20**, MiniApp **136/136**
-(bot_wakeup 41 + config-fidelity 15 + decision 58 + mcp 18 + server-lint 5 + retry.behavior 4).
+| 14 | 🔴 **The 3-attempt cap was voided again** (2nd audit) | After acked became *permanent*, "clean up the failure count for acked bots" changed meaning from "just rescued" to "**ever** rescued" ⇒ a rescued bot's failure count was wiped ⇒ **the 3-attempt cap stopped working** ⇒ the request stayed alive forever ⇒ **re-delivered every 60 seconds** (≈47k–93k tokens per turn). Now the failure count is cleared **only on success**; the failure path cleans up by age only |
+| 15 | 🔴 **The parser could panic** (2nd audit) | `parse_lenient_json` sliced a `&str` by **byte** offsets ⇒ a slice landing inside a multi-byte character **panics** ⇒ the whole daemon dies (and launchd restarts it into the same crash). Trigger: strict parsing fails **and** the file contains a backslash-u escape followed by non-ASCII (the production `state.json` has 895k non-ASCII characters). Now parsed at the **byte** level, plus a `catch_unwind` around the Bot watchdog so a panic there cannot take down quota handling and goal resuming |
+| 16 | 🟠 **"No turn record" was a dead branch** (2nd audit) | The judgment layer said `None => !is_idle(...)` while the caller immediately did `if !is_idle(...) { continue; }` — the two **negate each other** ⇒ such sessions could never be rescued. Now the decision is handed to the downstream `classify_error` + `is_idle` checks |
+| 17 | 🟠 **"Zombie turns" are no longer ignored forever** (2nd audit) | `accepted` means both "running" and "**left behind by a host crash**" (the production DB has 3 such zombies, the oldest stuck for 2 hours, on sessions with self-healing error codes) ⇒ the new rule treated them as "running" ⇒ rescuable bots were never rescued. Now: stuck in `accepted` for more than **1 hour** ⇒ treated as stuck and rescued |
+| 18 | 🟡 **lsof parsing switched to field mode** | The default table mode splits on whitespace ⇒ a **path containing spaces** is chopped up ⇒ `ends_with("/package")` is never true ⇒ "the runtime is down" is reported every round. Now uses `lsof -F` (the `n` field keeps spaces) |
+
+Tests: Rust **75/75**, Python **20/20**, MiniApp **144/144**
+(bot_wakeup 44 + config-fidelity 15 + decision 58 + mcp 18 + server-lint 5 + retry.behavior 4).
 
 ### v1.5 — architecture hardening (2026-10-20, evening)
 
