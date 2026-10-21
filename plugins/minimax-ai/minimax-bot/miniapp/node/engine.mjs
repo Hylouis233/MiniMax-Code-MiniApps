@@ -42,7 +42,7 @@ const HELPER_ACTIVE = new Set(['queued', 'running']);
  * ⇒ 延长到 10 档：8s → 20s → 40s → 60s ×7（指数退避、封顶 60 秒），
  *   总窗口约 **8 分钟**，足以自愈绝大多数瞬时抖动。
  *
- * ⚠️ **仍然有上限**（不是无限重试）：第 10 次之后就把原始错误暴露给用户。
+ * ⚠️ **有上限**：第 10 次之后就把原始错误暴露给用户，不让它一直转下去。
  * ⚠️ **这个数组就是唯一的旋钮**：注入空数组 = 完全不重试（既有语义不变）。
  */
 const TURN_RETRY_DELAYS_MS = [8000, 20000, 40000, 60000, 60000, 60000, 60000, 60000, 60000, 60000];
@@ -187,7 +187,7 @@ export class Engine {
     this.logger = deps.logger;
     /** Waits before each automatic retry of a failed turn (tests shorten them). */
     this.retryDelays = deps.retryDelaysMs ?? TURN_RETRY_DELAYS_MS;
-    /** 无限重试的退避基数与上限（测试会把它调小）。 */
+    /** 重试窗口的退避基数与上限（测试会把它调小）。 */
     /** @type {{ at: number, value: Promise<any> } | undefined} */
     this.catalogCache = undefined;
     /** @type {Map<string, { controller: AbortController, stoppedBy?: string }>} helper id -> run */
@@ -611,7 +611,7 @@ export class Engine {
         const reason = result?.error?.reason;
         // ── 两条重试路径（2026-10-19 实测补）──
         //
-        // A) **暂时性错误 ⇒ 无限重试**。
+        // A) **暂时性错误 ⇒ 值得重试**（但仍然受次数上限约束）。
         //    Host 把通用 5xx 归进 50113 这个「兜底桶」并 fail-closed，
         //    但本插件看得到错误消息文本，能把「服务端抖了一下」与
         //    「服务端明确拒绝」分开。实测这批 50113 全是暂时性故障
@@ -648,7 +648,7 @@ export class Engine {
           retryableFailure &&
           !input.answer &&
           !toolStarted &&
-          // ⚠️ **有上限**（2026-10-20 收敛）：暂时性错误**不再**无限重试。
+          // ⚠️ **有上限**（2026-10-20 收敛）：暂时性错误同样受次数上限约束。
           // 次数上限就是 `this.retryDelays.length`（默认 10 档 ⇒ 约 7.5 分钟窗口），
           // 注入空数组仍然表示「完全不重试」（既有语义一字未改）。
           attempt < this.retryDelays.length &&
@@ -669,7 +669,7 @@ export class Engine {
             s: Math.round(delay / 1000),
             n: attempt + 1,
             // 有次数上限 ⇒ 如实告诉用户还剩几次机会。
-            max: this.retryMaxAttempts + 1,
+            max: this.retryDelays.length + 1,
           },
         };
         flush(true);
