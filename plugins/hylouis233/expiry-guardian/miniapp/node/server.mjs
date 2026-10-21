@@ -570,8 +570,8 @@ function decide(
     level,
     // 距 5 小时额度刷新的倒计时（分钟）。页面直接显示，不用自己算。
     resetInMinutes: resetInMin,
-    // 距刷新不足这个分钟数时已暂停自动扣卡 —— 页面要说出来，
-    // 否则用户看到「额度快没了却不扣卡」会以为坏了。
+    // 距刷新不足这个分钟数时**不建议用卡** —— 页面要说出来，
+    // 否则用户看到「额度快没了却不建议用卡」会以为坏了。
     cardSkipBeforeResetMinutes: skipMinutes,
     skipCardActive: Boolean(skipCardReason),
     target:
@@ -1347,29 +1347,6 @@ export async function start(context) {
   };
   context.signal.addEventListener('abort', onAbort, { once: true });
   if (context.signal.aborted) await dispose();
-
-  // ── Bot 唤醒循环 ──
-  //
-  // 后台守护进程（Host 之外，无 token、无人值守）只做**判定 + 记账**：
-  // 把「要唤醒哪个 bot」写进 `bot-revive-requests.json`。
-  // 这里（Host 之内）负责**真正投递**。
-  //
-  // 为什么投递必须在这里做（2026-10-20 全部实测，详见 docs/BOT_DIAGNOSIS.md）：
-  //
-  // 1. **裸写队列项无效**：那是绕开 `steer` 直接塞行，Host 的队列轮询器不认
-  //    （隔离实验：3 分钟未被消费；官方 `session send` 则 5 秒内 accepted）。
-  // 2. **不能直接 `agent.run` 续 bot 会话**：`assertSessionOwnership` 判
-  //    `owner !== caller.pluginId` ⇒ `SESSION_NOT_FOUND`；而 45 个 bot 会话的
-  //    `purpose` 全是 `miniapp:minimax-bot` ⇒ 本插件永远被拒。
-  // 3. **能用的路径**：起一个自己的 agent 回合（`agent.run` 不带 sessionId），
-  //    让那个回合里的 agent 用 **mavis 工具的 `session send`** 把续跑消息
-  //    送进目标 bot 会话。`session send` 的准入是「目标可达即可」，
-  //    **不做 owner 检查** ⇒ 任何有 mavis 工具的会话都能唤醒任意 bot 会话。
-  //
-  // ⚠️ 代价：每个被唤醒的 bot 要烧**一个 agent 回合**（约 47k tokens，46k 缓存读）
-  // ⇒ 所以**只在真的有 pending 请求时才跑**，绝不空转。
-  //
-  // 不依赖 cron：面板开着它就在跑；关着时守护进程照常判定与记账，等面板再开时补上。
 
   const disposeAll = () => {
     void dispose();

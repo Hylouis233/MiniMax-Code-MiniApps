@@ -339,11 +339,24 @@ pub fn fmt_day(ms: Option<i64>) -> String {
 /// 桌面端与 Python 版都用本地时区展示；这里手算避免引入 chrono 依赖。
 /// libc 的 `struct tm`，只需本地时区换算用到的字段。
 #[repr(C)]
-#[derive(Default)]
 struct Tm {
     tm_sec: i32, tm_min: i32, tm_hour: i32, tm_mday: i32,
     tm_mon: i32, tm_year: i32, tm_wday: i32, tm_yday: i32, tm_isdst: i32,
     tm_gmtoff: i64, tm_zone: *const u8,
+}
+
+// ⚠️ 手写而不是 `#[derive(Default)]`（2026-10-21 维护者 review）：
+// `*const u8` 的 `Default` 实现并非所有 Rust 工具链都有
+// （老版本 cargo 直接报 E0277 ⇒ 整个包编译不过）。
+// ⇒ 自己给一个全零的 tm：语义与 derive 一致，且不依赖工具链版本。
+impl Default for Tm {
+    fn default() -> Self {
+        Tm {
+            tm_sec: 0, tm_min: 0, tm_hour: 0, tm_mday: 0,
+            tm_mon: 0, tm_year: 0, tm_wday: 0, tm_yday: 0, tm_isdst: 0,
+            tm_gmtoff: 0, tm_zone: std::ptr::null(),
+        }
+    }
 }
 
 #[repr(C)]
