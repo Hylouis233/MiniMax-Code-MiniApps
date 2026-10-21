@@ -2,14 +2,14 @@
 
 OpenVideo 基于 [OpenChatCut](https://github.com/0xsline/OpenChatCut) v0.2.16，固定提交 `2e6f4a29b784200cfb32b859b16f2561592bc3e8`，遵循 AGPL-3.0-or-later。上游完整源码由该提交提供；`upstream.patch` 是已跟踪文件的全部修改，`overlay/` 是新增源码，`adapter/` 是 Mini App 构建与验证脚本。运行入口和安装脚本以 `plugins/webguhui/openchatcut/miniapp/node/` 为源文件。对应许可证位于插件的 `LICENSE`。
 
-源码与可安装插件分开存放，避免把编译输入和测试程序重复计入安装包。插件可以直接复制安装，不需要用户编译。
+构建源码位于插件包内的 `source/` 目录，可安装运行时位于 `../miniapp/`。插件可以直接复制安装，不需要用户编译。
 
 ## 重建
 
 需要 Git、Node.js 24 和 npm。以下命令从仓库根目录执行；目标目录必须不存在。安装依赖和生成渲染资源会访问公共 npm、GitHub 和上游模型资源服务。
 
 ```sh
-node sources/webguhui/openchatcut/prepare-source.mjs ../openvideo-build
+node plugins/webguhui/openchatcut/source/prepare-source.mjs ../openvideo-build
 cd ../openvideo-build/upstream
 npm ci
 npm run sync:mediapipe

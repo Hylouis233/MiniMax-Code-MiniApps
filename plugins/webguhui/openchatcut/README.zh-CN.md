@@ -30,6 +30,6 @@ Windows、全部高级特效和导出格式、每种生成服务未逐一验收�
 
 更新时先关闭应用并退出客户端，再替换完整插件目录，保留独立的工程数据。不要为清缓存删除整个数据目录。
 
-本应用遵循 AGPL-3.0-or-later，保留 OpenChatCut 署名与第三方许可。[源码与重建说明](../../../sources/webguhui/openchatcut/README.md)和[许可证](LICENSE)随仓库提供。Remotion 等依赖另有自己的许可条款。
+本应用遵循 AGPL-3.0-or-later，保留 OpenChatCut 署名与第三方许可。[源码与重建说明](source/README.md)和[许可证](LICENSE)随仓库提供。Remotion 等依赖另有自己的许可条款。
 
 在 MiniMax Code 内导出时，先点“选择…”指定保存文件，再开始导出。默认浏览器下载方式依赖宿主的下载处理。

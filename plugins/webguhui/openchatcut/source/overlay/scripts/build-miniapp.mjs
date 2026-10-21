@@ -15,9 +15,9 @@ const existingOutput = await readdir(releaseRoot).catch(error => {
 });
 if (existingOutput.length) throw new Error('发布目录必须为空；请先将旧 release 移到回收站，避免混入过期产物。');
 await mkdir(join(releaseRoot, '.minimax-plugin'), { recursive: true });
-for (const file of ['INSTALL.md', 'package.json', 'servers.mcp.json', 'icon.png', '.minimax-plugin/plugin.json', 'miniapp/miniapp.json', 'miniapp/node/server.mjs', 'miniapp/node/setup-server.mjs', 'miniapp/node/install-dependencies.mjs', 'miniapp/node/native-dependencies.json', 'miniapp/node/lazy-resources.mjs', 'miniapp/node/resource-manifest.json']) {
+for (const file of ['INSTALL.md', 'package.json', 'servers.mcp.json', 'icon.png', '.minimax-plugin/plugin.json', 'miniapp/miniapp.json', 'miniapp/node/server.mjs', 'miniapp/node/setup-server.mjs', 'miniapp/node/install-dependencies.mjs', 'miniapp/node/native-dependencies.json', 'miniapp/node/lazy-resources.mjs', 'miniapp/node/resource-manifest.json', 'source']) {
   await mkdir(dirname(join(releaseRoot, file)), { recursive: true });
-  await cp(resolve(root, '..', file), join(releaseRoot, file));
+  await cp(resolve(root, '..', file), join(releaseRoot, file), { recursive: true });
 }
 await cp(join(root, 'SHADCN-LICENSE.md'), join(releaseRoot, 'SHADCN-LICENSE.md'));
 await mkdir(join(payload, 'node'), { recursive: true });

@@ -41,7 +41,7 @@ For generated media, configure a suitable tool in MiniMax Code first. Ask for on
 
 Close OpenVideo and exit MiniMax Code before replacing this complete plugin directory. Keep backups outside `plugins/` and preserve its separate data directory. Uninstalling the plugin does not necessarily remove project data.
 
-The runtime is prebuilt: do not install npm dependencies inside this directory. Corresponding modifications, the pinned upstream revision and reconstruction instructions are in [sources/webguhui/openchatcut](../../../sources/webguhui/openchatcut/README.md). Source files live outside the installable package to keep it within the 1,024-file / 64 MiB host limit.
+The runtime is prebuilt: do not install npm dependencies inside this directory. Corresponding modifications, the pinned upstream revision and reconstruction instructions are in [source/README.md](source/README.md).
 
 OpenVideo is an adaptation, not an official OpenChatCut release. OpenChatCut code and this derivative are distributed under **AGPL-3.0-or-later**; see [LICENSE](LICENSE). Preserve the upstream copyright notices. Bundled dependencies retain their own licenses, including [third-party notices](miniapp/node/THIRD-PARTY-NOTICES.txt), font licenses and [shadcn notices](SHADCN-LICENSE.md). Remotion has its own licensing terms included in those notices; inclusion here does not replace them.
 

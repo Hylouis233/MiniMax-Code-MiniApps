@@ -12,8 +12,8 @@ run(['-C', upstream, 'checkout', '--detach', '2e6f4a29b784200cfb32b859b16f256159
 run(['-C', upstream, 'apply', join(source, 'upstream.patch')]);
 await cp(join(source, 'overlay'), upstream, { recursive: true });
 await cp(join(source, 'adapter'), destination, { recursive: true });
-const plugin = resolve(source, '../../../plugins/webguhui/openchatcut');
-for (const file of ['INSTALL.md', 'README.md', 'README.zh-CN.md', 'LICENSE', 'package.json', 'servers.mcp.json', 'icon.png', '.minimax-plugin', 'miniapp/miniapp.json', 'miniapp/node/server.mjs', 'miniapp/node/setup-server.mjs', 'miniapp/node/install-dependencies.mjs', 'miniapp/node/native-dependencies.json', 'miniapp/node/lazy-resources.mjs', 'miniapp/node/resource-manifest.json']) {
+const plugin = resolve(source, '..');
+for (const file of ['INSTALL.md', 'README.md', 'README.zh-CN.md', 'LICENSE', 'package.json', 'servers.mcp.json', 'icon.png', '.minimax-plugin', 'miniapp/miniapp.json', 'miniapp/node/server.mjs', 'miniapp/node/setup-server.mjs', 'miniapp/node/install-dependencies.mjs', 'miniapp/node/native-dependencies.json', 'miniapp/node/lazy-resources.mjs', 'miniapp/node/resource-manifest.json', 'source']) {
   await cp(join(plugin, file), join(destination, file), { recursive: true });
 }
 console.log(`Prepared ${upstream}. Follow README.md to install build dependencies and compile.`);

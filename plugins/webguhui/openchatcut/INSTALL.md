@@ -14,7 +14,7 @@ Mini App 的字幕识别使用浏览器实现；未使用的 whisper-cli 原生�
 
 ## 维护与打包
 
-源码、固定上游版本和重建命令见本仓库 `sources/webguhui/openchatcut/README.md`。安装用户无需构建。
+源码、固定上游版本和重建命令见 `source/README.md`。安装用户无需构建。
 
 在应用根目录运行 `node scripts/verify-installer.mjs` 验证下载源、摘要拒绝、不支持平台和取消安装。完整验证还需在干净数据目录实际下载并启动，导出媒体，然后断网重启验证缓存。
 
