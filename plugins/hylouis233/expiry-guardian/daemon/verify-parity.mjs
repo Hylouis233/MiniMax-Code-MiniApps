@@ -66,7 +66,6 @@ writeFileSync(
       cardTriggerPercent: 99,
       cardSkipBeforeResetMinutes: 60,
       quotaLevels: { tight: 80, low: 95 },
-      goalPause: { enabled: false, triggerPercent: 99, resumeAtPercent: 0 },
     },
     null,
     2,

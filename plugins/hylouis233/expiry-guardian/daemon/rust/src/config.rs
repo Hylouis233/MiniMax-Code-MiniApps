@@ -45,7 +45,7 @@ impl Default for QuotaLevels {
 }
 
 /// `rename_all = "camelCase"` **不是可有可无的风格问题**：
-/// Node / Python 写出的配置键是 `goalPause.triggerPercent` 这类驼峰，
+/// Node / Python 写出的配置键是 `quotaLevels` / `cardTriggerPercent` 这类驼峰，
 /// 而 Rust 结构体字段是 snake_case。没有这行，serde 会认为**所有字段都不存在**，
 /// 然后逐个落到 `#[serde(default)]` —— 于是 `enabled` 永远读到 `false`，
 /// 且**一行错都不报**。这个坑真实发生过：功能看起来写完了，却永远打不开。
@@ -234,7 +234,7 @@ mod tests {
         // 反面：snake_case 现在应当被明确拒绝，而不是静默降级
         let snake = serde_json::json!({
             "schema_version": 1,
-            "goal_pause": { "enabled": true, "trigger_percent": 50 }
+            "card_trigger_percent": 50
         });
         assert!(
             serde_json::from_value::<Config>(snake).is_err(),

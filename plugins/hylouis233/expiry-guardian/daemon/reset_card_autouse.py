@@ -68,10 +68,7 @@ def default_config() -> dict[str, Any]:
         "schemaVersion": 1,
         "cardTriggerPercent": QUOTA_TRIGGER_PERCENT,
         "cardSkipBeforeResetMinutes": QUOTA_CARD_SKIP_BEFORE_RESET_MINUTES,
-        "resumeCronId": "",
         "quotaLevels": {"tight": QUOTA_TIGHT_PERCENT, "low": QUOTA_LOW_PERCENT},
-        "goalPause": {"enabled": False, "triggerPercent": QUOTA_TRIGGER_PERCENT,
-                      "resumeAtPercent": 0.0},
     }
 
 
@@ -116,7 +113,6 @@ def normalize_config(raw: Any) -> tuple[dict[str, Any], list[str]]:
         tight = d["quotaLevels"]["tight"]
         low = d["quotaLevels"]["low"]
 
-    gp = src.get("goalPause") if isinstance(src.get("goalPause"), dict) else {}
     raw_skip = src.get("cardSkipBeforeResetMinutes")
     skip = _clamp(raw_skip, 0.0, 1440.0, d["cardSkipBeforeResetMinutes"])
     if raw_skip is not None and skip != _clamp(raw_skip, 0.0, 1440.0, d["cardSkipBeforeResetMinutes"]):
@@ -125,15 +121,7 @@ def normalize_config(raw: Any) -> tuple[dict[str, Any], list[str]]:
         "schemaVersion": 1,
         "cardTriggerPercent": card,
         "cardSkipBeforeResetMinutes": skip,
-        "resumeCronId": str(src.get("resumeCronId") or "").strip(),
         "quotaLevels": {"tight": tight, "low": low},
-        "goalPause": {
-            "enabled": gp.get("enabled") is True,
-            "triggerPercent": _clamp(gp.get("triggerPercent"), 1.0, 100.0,
-                                     d["goalPause"]["triggerPercent"]),
-            "resumeAtPercent": _clamp(gp.get("resumeAtPercent"), 0.0, 100.0,
-                                      d["goalPause"]["resumeAtPercent"]),
-        },
     }, issues
 
 

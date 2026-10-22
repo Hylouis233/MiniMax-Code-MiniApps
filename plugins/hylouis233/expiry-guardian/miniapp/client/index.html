@@ -482,7 +482,7 @@
       let snapshot = null;
       let busy = false;
       // 后台守护进程是否在跑。null = 还没读到。
-      // 「目标自动暂停」由它执行，所以它停了，那个开关就名存实亡 —— 必须显式呈现。
+      // 自动判定由它执行，所以它停了，面板就不会再自动重算结论 —— 必须显式呈现。
       let daemonRunning = null;
       // 服务端只推送变化的明细分区，未变化的部分在这里保留，避免每次重拉
       const cachedCredits = { lost: null, active: null, usedUp: null };
@@ -507,8 +507,7 @@
       // v2.0 的自动判定**只出结论、不执行任何写操作** ⇒ 结果只有两种：
       //   OK    = 算出了一条结论
       //   ERROR = 这一轮没算出来
-      // v1.x 的 CARD_USED / CARD_FAILED / SKIPPED_DUPLICATE 等
-      // （真的去扣卡、幂等去重）在 v2.0 里**永远不会出现** ⇒ 不再列。
+      // v1.x 里真的去扣卡、幂等去重产生的那些结果，在 v2.0 里**永远不会出现** ⇒ 不再列。
       const OUTCOME = {
         OK: '已判定', ERROR: '判定失败',
       };
@@ -806,9 +805,6 @@
           ? `当前每 ${fmtInterval(d.autoIntervalMs)}自动判定一次，可在左侧随时调整。「立即判定一次」无节流，随时可点。判定为「保留积分」时不执行任何写操作。`
           : '自动刷新已关闭，页面只给出建议。开启后按设定间隔重算一次结论；「立即判定一次」无节流，随时可点。本插件只给建议，不做任何写操作。';
 
-        // ── 目标自动暂停：回显共享配置里的真实开关状态 ──
-        // 这里只是读写 ~/.config/mcode-reset-card/config.json；真正执行的是后台服务，
-        // 它每轮重读同一个文件，所以页面上的状态与实际生效状态是同一份。
         // 自动化阈值：四个阈值 + 刻度预览 + 冲突提示
         renderSettings(d.config, d.configIssues);
       }
@@ -839,8 +835,6 @@
         const tight = Number(cfg.quotaLevels?.tight ?? 80);
         const low = Number(cfg.quotaLevels?.low ?? 95);
         const cardT = Number(cfg.cardTriggerPercent ?? 99);
-        // ⚠️ v2.0 没有「暂停目标」这条线了（功能已删，配置里也没有 goalPause）。
-        //    不要在这里读 cfg.goalPause —— 它恒为 undefined。
 
         // ── 刻度预览：断轴 ──
         // 所有阈值都住在 80%~100% 这段，线性刻度会有 80% 的宽度全是空的，
@@ -1282,7 +1276,7 @@
           if (enabled) {
             const f = r.firstRun;
             const txt = f?.message ? `${label(f)} · ${f.message}` : f?.reason || '';
-            setStatus($('auto-status'), txt ? `首次判定：${txt}` : '已开启自动刷新', f?.outcome === 'CARD_ERROR' || f?.outcome === 'ERROR' ? 'err' : 'ok');
+            setStatus($('auto-status'), txt ? `首次判定：${txt}` : '已开启自动刷新', f?.outcome === 'ERROR' ? 'err' : 'ok');
           } else {
             setStatus($('auto-status'), '已关闭自动刷新', 'ok');
           }
@@ -1292,8 +1286,7 @@
 
       // ── 自动化阈值：四个输入框 ─────────────────────────────────────────────
       // ⚠️ 这里只列**页面上真实存在**的输入框 id。
-      // v2.0 删掉了「目标自动暂停」功能 ⇒ 它的输入框也从 DOM 里删了；
-      // 若这里还留着 `cfg-goal-trigger`，`getElementById` 会返回 null，
+      // 若这里列了一个 DOM 里没有的 id，`getElementById` 会返回 null，
       // 下一行 `$(id).addEventListener` 立刻抛 TypeError ⇒ **整段脚本后面的
       // 所有绑定全部不执行**（看板连不上、按钮全哑）。
       const SETTING_FIELDS = [
@@ -1315,7 +1308,7 @@
         try {
           const r = await (await fetch('/api/auto-run', { method: 'POST' })).json();
           const txt = r.message || r.reason || '';
-          const failed = ['CARD_FAILED', 'ERROR', 'CARD_ERROR'].includes(r?.outcome);
+          const failed = r?.outcome === 'ERROR';
           setStatus($('auto-status'), `${label(r)}${txt ? ' · ' + txt : ''}`, failed ? 'err' : 'ok');
           await load();
         } catch { setStatus($('auto-status'), '判定失败', 'err'); }
@@ -1362,8 +1355,6 @@
             : '未安装后台服务';
           $('daemon-toggle').disabled = !r.installed || daemonBusy;
           $('daemon-toggle-btn').disabled = !r.installed || daemonBusy;
-          // ⚠️ v2.0 没有「目标自动暂停」了 ⇒ 不再有 renderGoalPause 可调用。
-          //    留着这行会在守护进程状态刷新时抛 ReferenceError。
         } catch {
           $('daemon-hint').textContent = '无法读取后台服务状态';
         }
@@ -1379,8 +1370,7 @@
           const r = await (await fetch(`/api/daemon?action=${enable ? 'start' : 'stop'}`, { method: 'POST' })).json();
           daemonRunning = enable ? Boolean(r.running) : false;
           setStatus($('daemon-status'), r.message ?? (r.ok ? '操作完成' : '操作失败'), r.ok ? 'ok' : 'err');
-          // ⚠️ v2.0 停掉后台服务只是**不再自动重算结论**，不会「让目标被停住」——
-          //    本插件压根不碰目标。说错会让用户以为还有自动暂停这回事。
+          // 停掉后台服务只是**不再自动重算结论**，提示里要如实说清楚。
           if (!enable) {
             setStatus(
               $('daemon-status'),

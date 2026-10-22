@@ -1130,7 +1130,7 @@ export async function start(context) {
           snapshot.autoIntervalMs = state.autoIntervalMs;
           snapshot.lastResult = state.lastResult;
           snapshot.autoRuns = state.autoRuns.slice(0, 8);
-          // 共享配置原样下发，页面据此显示「目标自动暂停」的真实开关状态。
+          // 共享配置原样下发，页面据此回显真实的阈值设置。
           // 实际生效由 Rust 守护进程每轮重读同一文件决定，这里只负责读写与展示。
           const { config, issues } = readConfig();
           snapshot.config = config;
@@ -1205,9 +1205,6 @@ export async function start(context) {
       const { config, issues } = readConfig();
       const next = { ...config };
 
-      const rawEnabled = url.searchParams.get('goalEnabled');
-      const rawTrigger = url.searchParams.get('goalTriggerPercent');
-      const rawResume = url.searchParams.get('goalResumeAtPercent');
       const rawSkip = url.searchParams.get('cardSkipBeforeResetMinutes');
       if (rawSkip !== null) next.cardSkipBeforeResetMinutes = Number(rawSkip);
       const rawCardTrigger = url.searchParams.get('cardTriggerPercent');
