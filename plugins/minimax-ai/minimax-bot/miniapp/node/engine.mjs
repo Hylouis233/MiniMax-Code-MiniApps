@@ -30,69 +30,22 @@ const MAX_HELPERS_PER_BOT = 4;
 const HELPER_REPORT_CLIP = 8000;
 const HELPER_ACTIVE = new Set(['queued', 'running']);
 /**
- * A turn that failed before running any tool is retried this many more times, after these waits.
- * Model capacity errors (429/529) and timeouts usually clear within a minute.
+ * A turn that failed before running any tool is retried this many more times, after these waits
+ * (2 retries, about 28 seconds in all). Model capacity errors (429/529) and timeouts usually
+ * clear within a minute.
  */
+export const TURN_RETRY_DELAYS_MS = Object.freeze([8000, 20000]);
 /**
- * 重试窗口：**延迟序列 + 次数上限**（一个旋钮，两个含义 —— 与上游一致）。
- *
- * ⚠️ 为什么改（2026-10-20）：上游 0.7.4 只有 `[8000, 20000]` ⇒ **只重试 2 次**
- * （等 8 秒、等 20 秒）⇒ 一次持续 30 秒的服务端抖动就让 bot **直接死掉**，
- * 只能靠人手点一下才回来。
- * ⇒ 延长到 10 档：8s → 20s → 40s → 60s ×7（指数退避、封顶 60 秒），
- *   总窗口约 **8 分钟**，足以自愈绝大多数瞬时抖动。
- *
- * ⚠️ **有上限**：第 10 次之后就把原始错误暴露给用户，不让它一直转下去。
- * ⚠️ **这个数组就是唯一的旋钮**：注入空数组 = 完全不重试（既有语义不变）。
+ * The longer retry window, used only when the user turns on `settings.longRetry`: 10 retries
+ * backing off 8 s, 20 s, 40 s, then 60 s seven times, 488 seconds (about 8 minutes) in all.
+ * It retries the same failures as the default window, only for longer; after the last retry the
+ * original error is shown.
  */
-const TURN_RETRY_DELAYS_MS = [8000, 20000, 40000, 60000, 60000, 60000, 60000, 60000, 60000, 60000];
+export const LONG_TURN_RETRY_DELAYS_MS = Object.freeze([8000, 20000, 40000, 60000, 60000, 60000, 60000, 60000, 60000, 60000]);
 /** Failure reasons a retry cannot fix; anything else (or no reason from an older Host) may be retried. */
 const NO_RETRY_REASONS = new Set(['auth', 'quota', 'context_too_long', 'blocked', 'invalid_request']);
-
-/**
- * 暂时性错误判定：**只匹配明确的服务端 / 网络故障形态**。
- *
- * 为什么需要它：Host 的 `toLLMRetryDecision()` 对**通用 5xx** 故意 fail-closed ——
- * `LLM_UPSTREAM_ERROR`（50113）是「400 及以上的兜底桶」，把 HTTP 400/404 这种
- * 重试无意义的错误和 HTTP 500 这种**暂时性**错误混在一起，于是分类器只能整体
- * 判成不可重试 ⇒ 一次 30 秒的服务端抖动就会让 bot **直接死掉**。
- *
- * ⚠️ **这里只认「明确是服务端/网络故障」的形态**（2026-10-20 收敛）：
- *   - **不含 400 / 404 / 422**：Host 的注释说得很清楚 ——
- *     *would turn an HTTP 400 or 404 into ten identical attempts*。
- *     重试它们只是把同一次拒绝重复十遍。`invalid_request` 也在 `NO_RETRY_REASONS` 里。
- *   - **不含裸数字**：否则「用了 400 tokens」「第 404 步」这类正常消息会被误判成错误。
- *   判定「这次失败值不值得重试」的**第一道**依据始终是 Host 自己给的
- *   `result.error.retryable` 标志；这里只是补上 Host 判不出来的那一类。
- */
-const TRANSIENT_ERROR_PATTERNS = [
-  /net::ERR_NETWORK_CHANGED/i,
-  /ERR_NETWORK/i,
-  /ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE/i,
-  /socket hang up/i,
-  /internal server error/i,
-  /bad gateway|gateway timeout|service unavailable/i,
-  /open platform service unavailable/i,
-  /请求处理超时/,
-  /unknown error, *520/,
-  /overloaded|rate limit|too many requests|model is busy/i,
-  // 5xx 只认带上下文的形态（`HTTP 500` / `status 502` / `code=503`），
-  // 不认裸数字 —— 「用了 500 tokens」不是错误。
-  /\b(?:http|status(?:\s+code)?|code)\s*[:=]?\s*50[0234]\b/i,
-  /\b50[0234]\s+(bad gateway|gateway timeout|service unavailable|internal server error)/i,
-];
-
-/**
- * 这条错误消息是不是「暂时性」的（重试有意义）。
- *
- * @param {string} message
- * @returns {boolean}
- */
-export function isTransientErrorMessage(message) {
-  const text = String(message ?? '');
-  if (!text) return false;
-  return TRANSIENT_ERROR_PATTERNS.some((re) => re.test(text));
-}
+/** The turn may already have run, so sending it again could repeat its reply or its actions. */
+const OUTCOME_UNKNOWN = 'AGENT_OUTCOME_UNKNOWN';
 
 /** Resolves true after `ms`, or false at once if `signal` aborts first. */
 function sleepUnlessAborted(ms, signal) {
@@ -178,6 +131,8 @@ export class Engine {
    *   agent: MiniAppAgentClient | undefined,
    *   logger: import('./miniapp-api.js').MiniAppLogger,
    *   broadcast: (event: Record<string, unknown>) => void,
+   *   retryDelaysMs?: readonly number[],
+   *   longRetryDelaysMs?: readonly number[],
    * }} deps
    */
   constructor(deps) {
@@ -187,7 +142,8 @@ export class Engine {
     this.logger = deps.logger;
     /** Waits before each automatic retry of a failed turn (tests shorten them). */
     this.retryDelays = deps.retryDelaysMs ?? TURN_RETRY_DELAYS_MS;
-    /** 重试窗口的退避基数与上限（测试会把它调小）。 */
+    /** Waits used instead when `settings.longRetry` is on (tests shorten them). */
+    this.longRetryDelays = deps.longRetryDelaysMs ?? LONG_TURN_RETRY_DELAYS_MS;
     /** @type {{ at: number, value: Promise<any> } | undefined} */
     this.catalogCache = undefined;
     /** @type {Map<string, { controller: AbortController, stoppedBy?: string }>} helper id -> run */
@@ -365,6 +321,11 @@ export class Engine {
 
   async buildBrief(bot, chatId, query = '') {
     return `${this.buildStandingBrief(bot, chatId)}\n\n${await this.buildMemoryBrief(bot, query)}`;
+  }
+
+  /** The waits before each automatic retry of a failed turn: the long window only when the user turned it on. */
+  turnRetryDelays() {
+    return this.store.state.settings?.longRetry === true ? this.longRetryDelays : this.retryDelays;
   }
 
   // ------------------------------------------------------------------ core turn
@@ -563,11 +524,9 @@ export class Engine {
     let failure = '';
     let failureCode = '';
     let failureRetryable = false;
-    // 原始错误消息（未翻译）：暂时性错误的判定必须看**它**——
-    // `failure` 是 `describeAgentError()` 翻译后的文案（可能是「模型不可用」这类
-    // 泛化说法），里面已经没有 500 / 网络切换这些关键信息了。
-    let rawFailureMessage = '';
     let attempt = 0;
+    // Fixed for the whole turn, so the cap and the "n of max" shown while retrying agree.
+    const retryDelays = this.turnRetryDelays();
     try {
       for (;;) {
         result = undefined;
@@ -597,81 +556,37 @@ export class Engine {
             } catch (retryError) {
               failure = describeAgentError(retryError);
               failureCode = errorCode(retryError);
-              failureRetryable = Boolean(/** @type {any} */ (retryError)?.retryable);
-              rawFailureMessage = errorText(retryError);
+              failureRetryable = /** @type {any} */ (retryError)?.retryable === true;
             }
           } else {
             failure = describeAgentError(error);
             failureCode = errorCode(error);
-            failureRetryable = Boolean(/** @type {any} */ (error)?.retryable);
-            rawFailureMessage = errorText(error);
+            failureRetryable = /** @type {any} */ (error)?.retryable === true;
           }
         }
-        const failed = Boolean(failure) ? failureRetryable : result?.status === 'error';
+        // A thrown error is retried only when it says it is retryable; a failed result is retried
+        // unless it says it is not. Either way an explicit `retryable: false`, an outcome that may
+        // already have run, or a reason a retry cannot fix ends the turn.
+        const thrown = Boolean(failure);
         const reason = result?.error?.reason;
-        // ── 两条重试路径（2026-10-19 实测补）──
-        //
-        // A) **暂时性错误 ⇒ 值得重试**（但仍然受次数上限约束）。
-        //    Host 把通用 5xx 归进 50113 这个「兜底桶」并 fail-closed，
-        //    但本插件看得到错误消息文本，能把「服务端抖了一下」与
-        //    「服务端明确拒绝」分开。实测这批 50113 全是暂时性故障
-        //    （网络切换 / 500 / 超时 / 520 / 502 / 服务不可用）。
-        //    ⇒ 一直重试到成功，退避封顶 60 秒。
-        //
-        // B) **其它可重试错误 ⇒ 有限重试**（原有行为，2 次 / 28 秒窗口）。
-        //
-        // 两条路都排除：额度类（quota）、鉴权类（auth）、上下文过长、被拒、
-        // 参数非法 —— 这些重试一万次也没用。
-        // ⚠️ 成功后必须**立刻停止**重试。
-        // `rawFailureMessage` 保留着上一次失败的内容，而 `transient` 只看它 ——
-        // 于是第 4 次已经 `result.status === 'finished'` 了，却因为「上一次是
-        // 暂时性错误」而继续重试（实测 attempts 从 4 一路涨到 7，永远停不下来）。
-        // ⇒ 判据必须先看**本次**的结果是否成功。
-        const succeeded = result?.status === 'finished';
-        const transient =
-          !succeeded &&
-          isTransientErrorMessage(result?.error?.message ?? rawFailureMessage ?? '');
-        // ⚠️ 抛异常的路径里 `result` 是 undefined，所以不能用 `result?.status`。
-        // 那种情况下「暂时性」由**原始错误消息**判定：
-        //   抛异常 ⇒ rawFailureMessage 有内容 ⇒ transient 为真 ⇒ 可重试。
-        // ⚠️ 「暂时性」**不再**用来绕过下面两道判据：
-        //   - 不再绕过 `NO_RETRY_REASONS`（auth / quota / invalid_request 等）
-        //   - 不再绕过次数上限（见 `TURN_RETRY_MAX_ATTEMPTS`）
-        // 它只用来决定**退避用多长**。
-        const retryableFailure =
-          failed ||
-          (transient &&
-            !NO_RETRY_REASONS.has(reason) &&
-            reason !== 'auth' &&
-            reason !== 'quota');
+        const failed = thrown ? failureRetryable : result?.status === 'error' && result?.error?.retryable !== false;
+        const outcomeUnknown = failureCode === OUTCOME_UNKNOWN || result?.error?.code === OUTCOME_UNKNOWN;
         const canRetry =
-          retryableFailure &&
+          failed &&
+          !outcomeUnknown &&
+          !NO_RETRY_REASONS.has(reason) &&
           !input.answer &&
           !toolStarted &&
-          // ⚠️ **有上限**（2026-10-20 收敛）：暂时性错误同样受次数上限约束。
-          // 次数上限就是 `this.retryDelays.length`（默认 10 档 ⇒ 约 7.5 分钟窗口），
-          // 注入空数组仍然表示「完全不重试」（既有语义一字未改）。
-          attempt < this.retryDelays.length &&
+          attempt < retryDelays.length &&
           !controller.signal.aborted &&
-          !this.disposed &&
-          result?.error?.retryable !== false &&
-          !NO_RETRY_REASONS.has(reason);
+          !this.disposed;
         if (!canRetry) break;
-        // 延迟 = 窗口里的那一档（可注入 ⇒ 既有语义与既有测试都不受影响）。
-        const delay = this.retryDelays[attempt] ?? 0;
+        const delay = retryDelays[attempt];
         attempt += 1;
         // Words the failed attempt streamed are not the reply; the retry writes its own.
         message.parts = message.parts.filter((part) => part.type !== 'text');
         liveText = undefined;
-        message.live = {
-          key: 'live.retrying',
-          params: {
-            s: Math.round(delay / 1000),
-            n: attempt + 1,
-            // 有次数上限 ⇒ 如实告诉用户还剩几次机会。
-            max: this.retryDelays.length + 1,
-          },
-        };
+        message.live = { key: 'live.retrying', params: { s: Math.round(delay / 1000), n: attempt + 1, max: retryDelays.length + 1 } };
         flush(true);
         const waited = await sleepUnlessAborted(delay, controller.signal);
         message.live = undefined;

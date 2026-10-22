@@ -30,36 +30,10 @@ Copy this directory, including the hidden `.minimax-plugin/` directory, into the
 - **Reply actions**: the reaction, copy, quote-reply and open-session buttons sit at the bottom-left of a reply, under its last line. A long reply therefore keeps its actions within reach at the end of the text instead of pushing them off the top of the message. The reaction indicator sits directly above that row and is painted with the app's own tag colours, so it follows the light and dark themes.
 - **Working messages of one reply**: the Host records a text part for every turn a Bot takes between two tool calls, so a reply that worked for a while arrives with many parts, and the page draws one bubble per part. The bubbles keep the official shape and order, and a small gap between them tells them apart instead of letting them read as one block of text.
 
-## 0.7.8 Transient failures get a longer, still-capped retry window
+## 0.7.8 An optional longer retry window, and stricter retry rules
 
-A Bot that died from a **temporary** failure now comes back on its own.
-
-The Host classifies a generic 5xx as `LLM_UPSTREAM_ERROR` (50113) and deliberately
-fails closed on it: that code is a catch-all bucket for *any* status of 400 or above
-except 402/401/403/429/529, so retrying it blindly could turn an HTTP 400 or 404
-into ten identical attempts. The result is that a plain HTTP 500 — which usually
-clears on its own within seconds — killed the turn on the first try.
-
-This plugin sees the error **message**, so it can tell the two apart. Failures that
-name a transient condition (a network error, a 5xx, a gateway timeout, rate limiting,
-an overloaded model) are retried; failures that are a decision rather than a glitch
-are not.
-
-What changed in 0.7.8:
-
-- **The retry window is longer.** Earlier versions retried **twice** (after 8 s and 20 s), so a
-  blip that lasted 30 seconds killed the Bot. The window is now
-  `8s → 20s → 40s → 60s × 7` — ten attempts over roughly **eight minutes**, which
-  covers the overwhelming majority of transient outages.
-- **There is still a cap.** After the last attempt the original error surfaces as
-  it is. The window is also still the single knob: injecting
-  `retryDelaysMs: []` keeps meaning "do not retry at all".
-- **400 / 404 / 422 are never retried.** Retrying them only repeats the same
-  rejection ten times.
-- **The message match is narrow.** It requires an explicit server-side or network
-  shape (`net::ERR_NETWORK_CHANGED`, `Internal server error (500)`, `502 Bad
-  Gateway`, `rate limit exceeded`, `HTTP 500`, …), so ordinary text such as
-  "used 400 tokens" or "step 404 done" is never mistaken for an error.
+- **Longer retry window, off by default.** A failed turn is still retried twice (after 8 s and 20 s). Turning on `longRetry` in the settings (`PUT /api/settings` with `{"longRetry": true}`) retries it up to ten times instead, backing off 8 s, 20 s, 40 s and then 60 s, about 8 minutes in all. After the last retry the original error is shown.
+- **A turn whose outcome is unknown is never retried.** `AGENT_OUTCOME_UNKNOWN` means the turn may already have run, so sending it again could repeat its reply or its actions. Otherwise what is retried is unchanged: only a turn that failed before running any tool, and never a failure explicitly marked as not retryable, whether it was thrown or returned.
 
 ## 0.7.0 Reliable delegation and result delivery
 
@@ -96,7 +70,7 @@ Avatars are stored in the Mini App's `dataDir/avatars/`. `GET /api/avatars` list
 - Full history is kept locally. The page loads the latest 200 messages first and can page back through older ones; Copy as Markdown covers the whole history.
 - Messages carry stable increasing sequence numbers. A group member only advances past the snapshot that was actually submitted to the host, so messages arriving during its reply are not skipped.
 - Sending is de-duplicated per chat, and retries of the same content and attachments reuse the same submission ID. After a crash, only requests that clearly never started are recovered; when a reply placeholder exists but the host outcome is unknown, the request is reported as `delivery_uncertain` and the draft is kept, so tasks with side effects are not run twice.
-- Failed turns are retried automatically (after 8 s and 20 s), and a retry button is shown afterwards; if a message never reached the Bot, retry resends it.
+- Failed turns are retried automatically (after 8 s and 20 s, or for about 8 minutes with the `longRetry` setting), and a retry button is shown afterwards; if a message never reached the Bot, retry resends it.
 - Memory writes use a recoverable transaction covering the entry and its journal; an interrupted write returns `memory_pending` and is completed by a read, retry or restart without double counting. Before the first change to an existing scope, the original file is backed up to `dataDir/memory/backups/`.
 
 ## 0.6.5 Execution records and outcome notices

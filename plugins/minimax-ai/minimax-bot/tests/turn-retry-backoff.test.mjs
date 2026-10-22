@@ -1,70 +1,89 @@
-// 回合级重试：重试窗口 + 暂时性错误判定。
-//
-// 2026-10-20 收敛（依据上游 review 意见）：
-//   - 上游 0.7.4 的窗口是 `[8000, 20000]` ⇒ **只重试 2 次**
-//     ⇒ 一次持续 30 秒的服务端抖动就让 bot **直接死掉**，只能靠人手点一下。
-//   - 但「无限重试」又与维护者「给连续重试设个上限」的要求相反。
-//   ⇒ 收敛成：**默认窗口延长到 10 档（8s→20s→40s→60s×6，约 7.5 分钟）**，仍然有上限。
-//
-// ⚠️ 同时守住两条边界：
-//   1. 400 / 404 / 422 **不重试**（重试它们只是把同一次拒绝重复十遍）
-//   2. 正常消息（「用了 400 tokens」「第 404 步」）不会被误判成错误
-import { test } from 'node:test';
+// The automatic retry windows of a failed turn: the real exported defaults, and how the engine
+// picks and applies them.
 import assert from 'node:assert/strict';
-import { isTransientErrorMessage } from '../miniapp/node/engine.mjs';
+import { test } from 'node:test';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Store } from '../miniapp/node/store.mjs';
+import { MemoryStore } from '../miniapp/node/memory.mjs';
+import { Engine, LONG_TURN_RETRY_DELAYS_MS, TURN_RETRY_DELAYS_MS } from '../miniapp/node/engine.mjs';
+import { setLocale } from '../miniapp/node/i18n.mjs';
 
-/** 与 engine.mjs 里的默认窗口保持一致（改一处就要同步这里）。 */
-const DEFAULT_WINDOW_MS = [8000, 20000, 40000, 60000, 60000, 60000, 60000, 60000, 60000, 60000];
+async function fixture(t, deps = {}) {
+  const dir = await mkdtemp(join(tmpdir(), 'bot-turn-retry-window-'));
+  const store = new Store(dir);
+  const memory = new MemoryStore(dir);
+  await store.init();
+  await memory.init();
+  setLocale('en');
+  const events = [];
+  const engine = new Engine({ store, memory, logger: { warn() {} }, broadcast: (event) => events.push(structuredClone(event)), ...deps });
+  t.after(async () => {
+    engine.dispose();
+    await store.writeChain;
+    await rm(dir, { recursive: true, force: true });
+  });
+  return { store, engine, events };
+}
 
-test('默认重试窗口：10 档、指数退避、封顶 60 秒，总窗口约 8 分钟', () => {
-  assert.equal(DEFAULT_WINDOW_MS.length, 10, '必须有明确的上限（不是无限重试）');
-  assert.equal(DEFAULT_WINDOW_MS[0], 8000);
-  assert.equal(DEFAULT_WINDOW_MS[1], 20000);
-  assert.equal(DEFAULT_WINDOW_MS[2], 40000);
-  for (const d of DEFAULT_WINDOW_MS.slice(3)) assert.equal(d, 60000, '之后一律封顶 60s');
-  const total = DEFAULT_WINDOW_MS.reduce((a, b) => a + b, 0);
-  assert.ok(total >= 7 * 60_000 && total <= 9 * 60_000, `总窗口应约 8 分钟，实际 ${total}ms`);
+/** An Agent whose every turn starts and then fails with no retry verdict. */
+function alwaysFailing(calls) {
+  return {
+    async run(input, options) {
+      calls.count += 1;
+      options.onEvent({ type: 'turn.started', sessionId: 's1', turnId: `t${calls.count}` });
+      return { sessionId: 's1', turnId: `t${calls.count}`, status: 'error', error: { code: 'TURN_FAILED', message: 'The Agent turn failed.' } };
+    },
+  };
+}
+
+test('the default window is two retries after 8 s and 20 s, and a new engine uses it', async (t) => {
+  assert.deepEqual(TURN_RETRY_DELAYS_MS, [8000, 20000]);
+  assert.ok(Object.isFrozen(TURN_RETRY_DELAYS_MS));
+  const { store, engine } = await fixture(t);
+  assert.equal(store.state.settings.longRetry, false);
+  assert.equal(engine.turnRetryDelays(), TURN_RETRY_DELAYS_MS);
 });
 
-test('暂时性错误会被认出来（服务端 / 网络故障）', () => {
-  for (const m of [
-    'net::ERR_NETWORK_CHANGED',
-    'Internal server error (500)',
-    '502 Bad Gateway',
-    'service unavailable',
-    '请求处理超时 (2066)',
-    'unknown error, 520 (1000)',
-    'rate limit exceeded',
-    'The model is busy right now',
-    'HTTP 500',
-    'status 502',
-  ]) {
-    assert.equal(isTransientErrorMessage(m), true, `应判为暂时性：${m}`);
-  }
+test('the long window is ten capped retries, 488 seconds in all, used only when the setting is on', async (t) => {
+  assert.deepEqual(LONG_TURN_RETRY_DELAYS_MS, [8000, 20000, 40000, 60000, 60000, 60000, 60000, 60000, 60000, 60000]);
+  assert.ok(Object.isFrozen(LONG_TURN_RETRY_DELAYS_MS));
+  assert.equal(LONG_TURN_RETRY_DELAYS_MS.reduce((sum, ms) => sum + ms, 0), 488_000);
+  const { store, engine } = await fixture(t);
+  store.state.settings.longRetry = true;
+  assert.equal(engine.turnRetryDelays(), LONG_TURN_RETRY_DELAYS_MS);
+  store.state.settings.longRetry = false;
+  assert.equal(engine.turnRetryDelays(), TURN_RETRY_DELAYS_MS);
 });
 
-test('400 / 404 / 422 不重试（重试只是把同一次拒绝重复十遍）', () => {
-  for (const m of [
-    'HTTP 400 Bad Request',
-    'HTTP 404 Not Found',
-    'code=422',
-    '400 Bad Request',
-    '404 Not Found',
-  ]) {
-    assert.equal(isTransientErrorMessage(m), false, `不该重试：${m}`);
-  }
-});
+for (const longRetry of [false, true]) {
+  test(`a failing turn runs once plus one retry per wait of the ${longRetry ? 'long' : 'default'} window, and shows n of max`, async (t) => {
+    const { store, engine, events } = await fixture(t, { retryDelaysMs: [1, 1], longRetryDelaysMs: [1, 1, 1, 1, 1] });
+    store.state.settings.longRetry = longRetry;
+    const retries = longRetry ? 5 : 2;
+    const calls = { count: 0 };
+    engine.agent = alwaysFailing(calls);
+    const bot = store.state.bots[0];
+    const chatId = `bot:${bot.id}`;
+    const result = await engine.runBotTurn({ bot, chatId, text: 'Hello', kind: 'private' });
+    assert.equal(result.status, 'error');
+    assert.equal(calls.count, retries + 1);
+    assert.equal((await store.getMessages(chatId)).at(-1).retried, retries);
+    const shown = events
+      .map((event) => event.message?.live)
+      .filter((live) => live?.key === 'live.retrying')
+      .map((live) => `${live.params.n}/${live.params.max}`);
+    assert.deepEqual([...new Set(shown)], Array.from({ length: retries }, (_, i) => `${i + 2}/${retries + 1}`));
+  });
+}
 
-test('正常消息不会被误判成错误', () => {
-  for (const m of [
-    '用了 400 tokens',
-    '第 404 步完成',
-    '剩余 422 积分',
-    '当前已达到 Token Plan 用量上限 (2067)',
-    '积分已耗尽',
-    '',
-    undefined,
-  ]) {
-    assert.equal(isTransientErrorMessage(m), false, `不该判为暂时性：${m}`);
-  }
+test('an engine given no retry waits never retries, even with the long window on', async (t) => {
+  const { store, engine } = await fixture(t, { retryDelaysMs: [], longRetryDelaysMs: [] });
+  store.state.settings.longRetry = true;
+  const calls = { count: 0 };
+  engine.agent = alwaysFailing(calls);
+  const bot = store.state.bots[0];
+  await engine.runBotTurn({ bot, chatId: `bot:${bot.id}`, text: 'Hello', kind: 'private' });
+  assert.equal(calls.count, 1);
 });

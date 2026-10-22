@@ -151,8 +151,8 @@ function defaultState() {
     /** Background helpers: queued / running ones and the most recent finished ones. */
     helpers: [],
     taskBatches: [],
-    /** `language`: 'auto' (follow the OS) | 'zh' | 'en' */
-    settings: { language: 'auto', userName: '' },
+    /** `language`: 'auto' (follow the OS) | 'zh' | 'en'. `longRetry`: retry failed turns for about 8 minutes instead of about 28 seconds. */
+    settings: { language: 'auto', userName: '', longRetry: false },
     /** OS language last reported by the page, used to resolve `auto`. */
     systemLocale: undefined,
   };
