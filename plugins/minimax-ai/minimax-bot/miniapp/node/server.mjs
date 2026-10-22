@@ -516,8 +516,6 @@ export async function start(context) {
         if (name.length > USER_NAME_MAX) throw new EngineError('invalid', t('err.userNameTooLong', { max: USER_NAME_MAX }));
         next.userName = name;
       }
-      // Off by default: retry a failed turn for about 8 minutes instead of about 28 seconds.
-      if (body.longRetry !== undefined) next.longRetry = body.longRetry === true;
       store.state.settings = next;
       if (body.language !== undefined) await team.applyLocale();
       else {

@@ -30,10 +30,11 @@ Copy this directory, including the hidden `.minimax-plugin/` directory, into the
 - **Reply actions**: the reaction, copy, quote-reply and open-session buttons sit at the bottom-left of a reply, under its last line. A long reply therefore keeps its actions within reach at the end of the text instead of pushing them off the top of the message. The reaction indicator sits directly above that row and is painted with the app's own tag colours, so it follows the light and dark themes.
 - **Working messages of one reply**: the Host records a text part for every turn a Bot takes between two tool calls, so a reply that worked for a while arrives with many parts, and the page draws one bubble per part. The bubbles keep the official shape and order, and a small gap between them tells them apart instead of letting them read as one block of text.
 
-## 0.7.8 An optional longer retry window, and stricter retry rules
+## 0.7.8 Safer automatic retries
 
-- **Longer retry window, off by default.** A failed turn is still retried twice (after 8 s and 20 s). Turning on `longRetry` in the settings (`PUT /api/settings` with `{"longRetry": true}`) retries it up to ten times instead, backing off 8 s, 20 s, 40 s and then 60 s, about 8 minutes in all. After the last retry the original error is shown.
-- **A turn whose outcome is unknown is never retried.** `AGENT_OUTCOME_UNKNOWN` means the turn may already have run, so sending it again could repeat its reply or its actions. Otherwise what is retried is unchanged: only a turn that failed before running any tool, and never a failure explicitly marked as not retryable, whether it was thrown or returned.
+- A failed turn is still retried automatically at most twice, after 8 s and 20 s.
+- A failure marked `retryable: false` is never retried automatically, whether it was thrown or returned, and whatever its message says.
+- A turn whose outcome is unknown (`AGENT_OUTCOME_UNKNOWN`) is never resent automatically: it may already have run, and resending it could repeat a reply or an action.
 
 ## 0.7.0 Reliable delegation and result delivery
 
@@ -70,7 +71,7 @@ Avatars are stored in the Mini App's `dataDir/avatars/`. `GET /api/avatars` list
 - Full history is kept locally. The page loads the latest 200 messages first and can page back through older ones; Copy as Markdown covers the whole history.
 - Messages carry stable increasing sequence numbers. A group member only advances past the snapshot that was actually submitted to the host, so messages arriving during its reply are not skipped.
 - Sending is de-duplicated per chat, and retries of the same content and attachments reuse the same submission ID. After a crash, only requests that clearly never started are recovered; when a reply placeholder exists but the host outcome is unknown, the request is reported as `delivery_uncertain` and the draft is kept, so tasks with side effects are not run twice.
-- Failed turns are retried automatically (after 8 s and 20 s, or for about 8 minutes with the `longRetry` setting), and a retry button is shown afterwards; if a message never reached the Bot, retry resends it.
+- Failed turns are retried automatically (after 8 s and 20 s), and a retry button is shown afterwards; if a message never reached the Bot, retry resends it.
 - Memory writes use a recoverable transaction covering the entry and its journal; an interrupted write returns `memory_pending` and is completed by a read, retry or restart without double counting. Before the first change to an existing scope, the original file is backed up to `dataDir/memory/backups/`.
 
 ## 0.6.5 Execution records and outcome notices

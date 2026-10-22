@@ -30,22 +30,29 @@ const MAX_HELPERS_PER_BOT = 4;
 const HELPER_REPORT_CLIP = 8000;
 const HELPER_ACTIVE = new Set(['queued', 'running']);
 /**
- * A turn that failed before running any tool is retried this many more times, after these waits
- * (2 retries, about 28 seconds in all). Model capacity errors (429/529) and timeouts usually
- * clear within a minute.
+ * A turn that failed before running any tool is retried this many more times, after these waits.
+ * Model capacity errors (429/529) and timeouts usually clear within a minute.
  */
 export const TURN_RETRY_DELAYS_MS = Object.freeze([8000, 20000]);
-/**
- * The longer retry window, used only when the user turns on `settings.longRetry`: 10 retries
- * backing off 8 s, 20 s, 40 s, then 60 s seven times, 488 seconds (about 8 minutes) in all.
- * It retries the same failures as the default window, only for longer; after the last retry the
- * original error is shown.
- */
-export const LONG_TURN_RETRY_DELAYS_MS = Object.freeze([8000, 20000, 40000, 60000, 60000, 60000, 60000, 60000, 60000, 60000]);
 /** Failure reasons a retry cannot fix; anything else (or no reason from an older Host) may be retried. */
-const NO_RETRY_REASONS = new Set(['auth', 'quota', 'context_too_long', 'blocked', 'invalid_request']);
-/** The turn may already have run, so sending it again could repeat its reply or its actions. */
+export const NO_RETRY_REASONS = new Set(['auth', 'quota', 'context_too_long', 'blocked', 'invalid_request']);
+/** The turn may already have run, so resending it could repeat a reply or an action. */
 const OUTCOME_UNKNOWN = 'AGENT_OUTCOME_UNKNOWN';
+
+/**
+ * Whether a failed turn may be sent again automatically. `retryable: false` always vetoes,
+ * whether it was thrown or returned, and so does an unknown outcome or a reason a retry
+ * cannot fix. A thrown error is retried only when it says `retryable: true`; a returned
+ * `error` result without the flag may be retried.
+ *
+ * @param {{ thrown: boolean, retryable?: unknown, code?: string, reason?: string }} failure
+ */
+export function mayRetryFailure({ thrown, retryable, code, reason }) {
+  if (retryable === false) return false;
+  if (code === OUTCOME_UNKNOWN) return false;
+  if (reason && NO_RETRY_REASONS.has(reason)) return false;
+  return thrown ? retryable === true : true;
+}
 
 /** Resolves true after `ms`, or false at once if `signal` aborts first. */
 function sleepUnlessAborted(ms, signal) {
@@ -131,8 +138,6 @@ export class Engine {
    *   agent: MiniAppAgentClient | undefined,
    *   logger: import('./miniapp-api.js').MiniAppLogger,
    *   broadcast: (event: Record<string, unknown>) => void,
-   *   retryDelaysMs?: readonly number[],
-   *   longRetryDelaysMs?: readonly number[],
    * }} deps
    */
   constructor(deps) {
@@ -142,8 +147,6 @@ export class Engine {
     this.logger = deps.logger;
     /** Waits before each automatic retry of a failed turn (tests shorten them). */
     this.retryDelays = deps.retryDelaysMs ?? TURN_RETRY_DELAYS_MS;
-    /** Waits used instead when `settings.longRetry` is on (tests shorten them). */
-    this.longRetryDelays = deps.longRetryDelaysMs ?? LONG_TURN_RETRY_DELAYS_MS;
     /** @type {{ at: number, value: Promise<any> } | undefined} */
     this.catalogCache = undefined;
     /** @type {Map<string, { controller: AbortController, stoppedBy?: string }>} helper id -> run */
@@ -321,11 +324,6 @@ export class Engine {
 
   async buildBrief(bot, chatId, query = '') {
     return `${this.buildStandingBrief(bot, chatId)}\n\n${await this.buildMemoryBrief(bot, query)}`;
-  }
-
-  /** The waits before each automatic retry of a failed turn: the long window only when the user turned it on. */
-  turnRetryDelays() {
-    return this.store.state.settings?.longRetry === true ? this.longRetryDelays : this.retryDelays;
   }
 
   // ------------------------------------------------------------------ core turn
@@ -523,16 +521,17 @@ export class Engine {
     let result;
     let failure = '';
     let failureCode = '';
-    let failureRetryable = false;
+    /** @type {unknown} */
+    let failureRetryable;
+    let failureReason = '';
     let attempt = 0;
-    // Fixed for the whole turn, so the cap and the "n of max" shown while retrying agree.
-    const retryDelays = this.turnRetryDelays();
     try {
       for (;;) {
         result = undefined;
         failure = '';
         failureCode = '';
-        failureRetryable = false;
+        failureRetryable = undefined;
+        failureReason = '';
         if (controller.signal.aborted || this.isStale(ticket)) {
           controller.abort();
           result = skippedTurn();
@@ -556,37 +555,35 @@ export class Engine {
             } catch (retryError) {
               failure = describeAgentError(retryError);
               failureCode = errorCode(retryError);
-              failureRetryable = /** @type {any} */ (retryError)?.retryable === true;
+              failureRetryable = /** @type {any} */ (retryError)?.retryable;
+              failureReason = String(/** @type {any} */ (retryError)?.reason ?? '');
             }
           } else {
             failure = describeAgentError(error);
             failureCode = errorCode(error);
-            failureRetryable = /** @type {any} */ (error)?.retryable === true;
+            failureRetryable = /** @type {any} */ (error)?.retryable;
+            failureReason = String(/** @type {any} */ (error)?.reason ?? '');
           }
         }
-        // A thrown error is retried only when it says it is retryable; a failed result is retried
-        // unless it says it is not. Either way an explicit `retryable: false`, an outcome that may
-        // already have run, or a reason a retry cannot fix ends the turn.
         const thrown = Boolean(failure);
-        const reason = result?.error?.reason;
-        const failed = thrown ? failureRetryable : result?.status === 'error' && result?.error?.retryable !== false;
-        const outcomeUnknown = failureCode === OUTCOME_UNKNOWN || result?.error?.code === OUTCOME_UNKNOWN;
+        const failed = thrown || result?.status === 'error';
         const canRetry =
           failed &&
-          !outcomeUnknown &&
-          !NO_RETRY_REASONS.has(reason) &&
+          mayRetryFailure(thrown
+            ? { thrown, retryable: failureRetryable, code: failureCode, reason: failureReason }
+            : { thrown, retryable: result?.error?.retryable, code: result?.error?.code, reason: result?.error?.reason }) &&
           !input.answer &&
           !toolStarted &&
-          attempt < retryDelays.length &&
+          attempt < this.retryDelays.length &&
           !controller.signal.aborted &&
           !this.disposed;
         if (!canRetry) break;
-        const delay = retryDelays[attempt];
+        const delay = this.retryDelays[attempt];
         attempt += 1;
         // Words the failed attempt streamed are not the reply; the retry writes its own.
         message.parts = message.parts.filter((part) => part.type !== 'text');
         liveText = undefined;
-        message.live = { key: 'live.retrying', params: { s: Math.round(delay / 1000), n: attempt + 1, max: retryDelays.length + 1 } };
+        message.live = { key: 'live.retrying', params: { s: Math.round(delay / 1000), n: attempt + 1, max: this.retryDelays.length + 1 } };
         flush(true);
         const waited = await sleepUnlessAborted(delay, controller.signal);
         message.live = undefined;
