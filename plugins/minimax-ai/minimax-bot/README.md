@@ -30,6 +30,12 @@ Copy this directory, including the hidden `.minimax-plugin/` directory, into the
 - **Reply actions**: the reaction, copy, quote-reply and open-session buttons sit at the bottom-left of a reply, under its last line. A long reply therefore keeps its actions within reach at the end of the text instead of pushing them off the top of the message. The reaction indicator sits directly above that row and is painted with the app's own tag colours, so it follows the light and dark themes.
 - **Working messages of one reply**: the Host records a text part for every turn a Bot takes between two tool calls, so a reply that worked for a while arrives with many parts, and the page draws one bubble per part. The bubbles keep the official shape and order, and a small gap between them tells them apart instead of letting them read as one block of text.
 
+## 0.7.8 Safer automatic retries
+
+- A failed turn is still retried automatically at most twice, after 8 s and 20 s.
+- A failure marked `retryable: false` is never retried automatically, whether it was thrown or returned, and whatever its message says.
+- A turn whose outcome is unknown (`AGENT_OUTCOME_UNKNOWN`) is never resent automatically: it may already have run, and resending it could repeat a reply or an action.
+
 ## 0.7.0 Reliable delegation and result delivery
 
 Chat with your Bot as usual. It can ask other Bots for help while you keep chatting; completed results return here, and you can stop the work at any time.
