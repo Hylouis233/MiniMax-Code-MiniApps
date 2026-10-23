@@ -55,7 +55,7 @@ console.log('=== initialize 要能协商协议版本 ===');
   check('serverInfo 版本是 2.0.0', r.body?.result?.serverInfo?.version === '2.0.0');
 }
 
-console.log('\n=== tools/list 要列出三个工具 ===');
+console.log('\n=== tools/list 要列出两个工具 ===');
 {
   const handler = createMcpHandler({
     status: async () => ({}),
@@ -67,7 +67,7 @@ console.log('\n=== tools/list 要列出三个工具 ===');
   const names = (r.body?.result?.tools ?? []).map((t) => t.name).sort();
   check('两个工具都在', names.length === 2, names.join(','));
   check('包含 watchdog_status', names.includes('watchdog_status'));
-    check('包含 watchdog_decide', names.includes('watchdog_decide'));
+  check('包含 watchdog_decide', names.includes('watchdog_decide'));
   check('**不含**扣卡工具', !names.includes('watchdog_use_card'), names.join(','));
 }
 
