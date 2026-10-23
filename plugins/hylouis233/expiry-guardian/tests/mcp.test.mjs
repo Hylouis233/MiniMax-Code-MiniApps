@@ -39,7 +39,6 @@ console.log('=== initialize 要能协商协议版本 ===');
 {
   const handler = createMcpHandler({
     status: async () => ({ ok: true }),
-    wake: async () => ({ woke: 1 }),
     decide: async () => ({ action: 'wait' }),
   });
   const send = makeTransport(handler);
@@ -59,7 +58,6 @@ console.log('\n=== tools/list 要列出两个工具 ===');
 {
   const handler = createMcpHandler({
     status: async () => ({}),
-    wake: async () => ({}),
     decide: async () => ({}),
   });
   const send = makeTransport(handler);
@@ -76,7 +74,6 @@ console.log('\n=== tools/call：async 的 status 也要真的 await（否则返�
   const handler = createMcpHandler({
     // ⚠️ 故意用 async —— 这正是踩坑的形态。
     status: async () => ({ quota: { used: 3 }, pendingWakes: [{ id: 'x', attempts: 2 }] }),
-    wake: async () => ({ revived: 2 }),
     decide: async () => ({ action: 'wait', reason: '额度充足' }),
   });
   const send = makeTransport(handler);
@@ -114,7 +111,6 @@ console.log('\n=== 未知工具要报明确的错（不能静默） ===');
 {
   const handler = createMcpHandler({
     status: async () => ({}),
-    wake: async () => ({}),
     decide: async () => ({}),
   });
   const send = makeTransport(handler);
