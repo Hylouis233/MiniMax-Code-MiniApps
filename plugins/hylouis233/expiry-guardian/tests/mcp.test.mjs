@@ -52,7 +52,7 @@ console.log('=== initialize 要能协商协议版本 ===');
   check('返回 ok', r.status === 200, `status=${r.status}`);
   check('协议版本协商一致', r.body?.result?.protocolVersion === '2025-06-18');
   check('serverInfo 名字对', r.body?.result?.serverInfo?.name === 'expiry-guardian');
-  check('serverInfo 版本是 1.6.0', r.body?.result?.serverInfo?.version === '1.6.0');
+  check('serverInfo 版本是 2.0.0', r.body?.result?.serverInfo?.version === '2.0.0');
 }
 
 console.log('\n=== tools/list 要列出三个工具 ===');

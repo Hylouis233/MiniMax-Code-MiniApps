@@ -221,7 +221,7 @@ acked 永久化、失败计数只在成功时归零、静态守卫……）**保
 
 ## 运行环境
 
-- **MiniMax Code 3.1.2 或更高版本** —— Mini App 声明了 `agentAccess` 与 `agentConcurrency`
+- **MiniMax Code 3.1.2 或更高版本**
 - macOS 上验证过；上游校验跑在 **Node 20** 上
 - Rust 守护进程需要 Rust 工具链来编译（`cargo build --release`）
 

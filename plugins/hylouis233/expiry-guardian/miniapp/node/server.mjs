@@ -326,16 +326,12 @@ export function normalizeConfig(raw) {
     schemaVersion: 1,
     cardTriggerPercent,
     cardSkipBeforeResetMinutes,
-    // ⚠️ `resumeCronId` 已彻底删除（2026-10-20）：本插件不再武装/解除武装任何 cron。
-    // 恢复流程改为：守护进程（Host 外）只写请求文件，**MiniMax Bot 自己的 MiniApp**
-    // 用 `agent.run` 投递（只有它对 bot 会话有归属权限）。
     quotaLevels: { tight, low },
   };
   return { config, issues };
 }
 
 /** 读配置。文件不存在是正常情况（首次运行），返回默认值且不记 issue。 */
-/** Bot 守护配置的归一化：非法值夹到合法区间，缺失用默认。 */
 function readConfig() {
   let text;
   try {
@@ -1027,11 +1023,10 @@ export async function start(context) {
   // 声明了 `mcpEndpoints` 就必须真的实现它：Host 发布时会用
   // `initialize` + `tools/list` 探活，探不通就发布失败。
   //
-  // ⚠️ 刻意**不**暴露「扣卡」：扣卡是真实写操作（少一张卡），
-  // 让别的插件随手就能扣太危险。要扣走面板按钮。
+  // ⚠️ 两个工具都只读：v2.0 不扣卡、不做任何写操作，MCP 也只给状态和建议。
   const handleMcp = createMcpHandler({
     status: async () => {
-      // 额度快照需要登录态；拿不到就只报 bot 那部分（不要让整个工具失败）。
+      // 账本读不到时不让整个工具失败：额度与判定置 null，原因放进 quotaError。
       let snapshot = null;
       let quotaError = null;
       try {

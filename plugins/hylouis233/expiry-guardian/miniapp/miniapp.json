@@ -16,10 +16,6 @@
   "surface": {
     "path": "/dashboard"
   },
-  "agentAccess": [
-    "session.run"
-  ],
-  "agentConcurrency": 2,
   "mcpEndpoints": [
     {
       "server": "expiry-guardian",

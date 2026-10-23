@@ -17,11 +17,12 @@
  *
  * | 工具 | 作用 |
  * | --- | --- |
- * | `watchdog_status` | 查本地账本里的额度、重置卡、积分与当前判定结论 |
+ * | `watchdog_status` | 查本地账本里的额度用量、可用重置卡与当前判定结论（含最早到期的卡与积分） |
  * | `watchdog_decide` | 立即判定一次：现在该不该用卡、用哪张、为什么（**只判定不扣卡**） |
  *
- * 这样别的插件（例如 minimax-bot）可以在自己的回合里直接问蹬王之王
- * 「额度还剩多少」「哪些 bot 挂了」，而不必读文件。
+ * 这样别的插件可以在自己的回合里直接问蹬王之王
+ * 「额度还剩多少」「现在该用卡还是留积分」，而不必自己读账本文件。
+ * 两个工具都**只读**：不扣卡、不改账本，也不改配置。
  */
 
 const PROTOCOL_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05'];
@@ -32,15 +33,18 @@ function toolDefs() {
     {
       name: 'watchdog_status',
       description:
-        '查蹬王之王的当前状态：5 小时额度用量、重置卡与积分的到期时间、' +
-        '以及待唤醒的 bot 列表（挂了但还没叫醒的）。',
+        '查蹬王之王的当前状态（数据来自用户维护的本地账本，只读）：' +
+        '5 小时与每周额度用量、未过期的重置卡及其到期时间、账本最后更新时间，' +
+        '以及当前的用卡判定（建议动作、理由、最早到期的重置卡与积分）。' +
+        '账本读不到时额度与判定为 null，原因写在 quotaError 里。',
       inputSchema: { type: 'object', properties: {}, required: [], additionalProperties: false },
     },
     {
       name: 'watchdog_decide',
       description:
-        '立即判定一次额度：按「先过期先用」算出现在该不该用重置卡、用哪一张、为什么。' +
-        '**只判定不扣卡** —— 真要扣请用面板上的按钮。',
+        '基于本地账本立即判定一次：按「先过期先用」比较最早到期的重置卡与积分，' +
+        '返回建议动作（use-card / use-credit / wait / idle）、理由，以及建议使用的那张卡（没有则为 null）。' +
+        '**只给建议，不扣卡、不改账本** —— 本插件只读，是否用卡由用户自行决定。',
       inputSchema: { type: 'object', properties: {}, required: [], additionalProperties: false },
     },
   ];
@@ -70,7 +74,7 @@ export function createMcpHandler(deps) {
           result = {
             protocolVersion: PROTOCOL_VERSIONS.includes(requested) ? requested : PROTOCOL_VERSIONS[0],
             capabilities: { tools: { listChanged: false } },
-            serverInfo: { name: 'expiry-guardian', version: '1.6.0' },
+            serverInfo: { name: 'expiry-guardian', version: '2.0.0' },
             instructions:
               '蹬王之王：基于本地账本追踪积分与重置卡的到期时间，' +
               '并给出「先过期先用」的用卡/留积分建议。' +

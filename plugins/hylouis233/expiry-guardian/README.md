@@ -174,7 +174,7 @@ just guards the local ledger now instead of the host's private state.
 
 ## Tested environment
 
-- **MiniMax Code 3.1.2 or later** — the Mini App declares `agentAccess` and `agentConcurrency`.
+- **MiniMax Code 3.1.2 or later.**
 - Verified on macOS; the upstream checks run on **Node 20**.
 - The Rust daemon needs a Rust toolchain to build (`cargo build --release`).
 
